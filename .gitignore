@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.pyc
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Checkpoints & models
+ckp_nll*/
+log4/
+log4_diff/
+*.pth
+*.tar
+
+# Logs
+logs_nll/
+runs/
+oldlog/
+*.txt
+
+# TensorBoard
+events.out.tfevents.*
