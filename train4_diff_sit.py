@@ -262,6 +262,12 @@ def train(train_dataloader, eval_dataloader, epochs, ckp_dir, log_dir, resume=Fa
     os.makedirs('log4_diff', exist_ok=True)
 
     for epoch in range(start_epoch, epochs):
+        # Warm-up: large lambda for first 500 epochs to prevent posterior collapse
+        if epoch < 500:
+            rd_criterion.lmbda = 10.0
+        else:
+            rd_criterion.lmbda = 0.1
+
         train_one_epoch(nll_module_I, nll_module_P, rd_criterion, train_dataloader, optimizer_P, aux_optimizer_P, optimizer_nll_P, 0, tb_writer, clip_max_norm=1.0)
         if epoch > 0 and epoch % 30 == 0:
             eval_epoch(nll_module_I, nll_module_P, rd_criterion, eval_dataloader, epoch, tb_writer)
