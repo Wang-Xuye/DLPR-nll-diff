@@ -1,5 +1,10 @@
 import os
 os.environ['CUDA_VISIBLE_DEVICES'] = '3'
+
+# ============ 路径配置 ============
+SAVE_DIR = "log4_diff_warmup_nobpp500"
+# =================================
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -125,9 +130,10 @@ class Dataset_test():
 
 class RateDistortion_diff(nn.Module):
     """Modified RateDistortion that uses diffusion_loss instead of MSE."""
-    def __init__(self, lmbda=0.1):
+    def __init__(self, lmbda=0.1, use_bpp=True):
         super().__init__()
         self.lmbda = lmbda
+        self.use_bpp = use_bpp
         self.mse = nn.MSELoss()
 
     def forward(self, output, target):
@@ -148,7 +154,10 @@ class RateDistortion_diff(nn.Module):
             x_hat = torch.clamp(output["x_hat"], min=-0.5, max=nii_max_f + 0.5)
             out["mse_loss"] = self.mse(x_hat, target)
 
-        out["loss"] = self.lmbda * out["mse_loss"] + out["img_bpp"] + out["res_bpp"]
+        if self.use_bpp:
+            out["loss"] = self.lmbda * out["mse_loss"] + out["img_bpp"] + out["res_bpp"]
+        else:
+            out["loss"] = out["mse_loss"]
 
         return out
 
@@ -228,7 +237,7 @@ def eval_epoch(model_I, model_P, criterion, eval_dataloader, epoch, tb_writer=No
     res_bpp_p /= eval_size * 7
     res_bpp_cond_p /= eval_size * 7
 
-    torch.save(model_P.state_dict(), 'log4_diff/p-Ep{}-{:.3f}-{:.3f}-{:.3f}.pth'.format(epoch + 1, img_bpp_p, img_bpp_p + res_bpp_p, img_bpp_p + res_bpp_cond_p))
+    torch.save(model_P.state_dict(), f'{SAVE_DIR}/p-Ep{epoch + 1}-{img_bpp_p:.3f}-{img_bpp_p + res_bpp_p:.3f}-{img_bpp_p + res_bpp_cond_p:.3f}.pth')
 
 
 def train(train_dataloader, eval_dataloader, epochs, ckp_dir, log_dir, resume=False):
@@ -259,13 +268,14 @@ def train(train_dataloader, eval_dataloader, epochs, ckp_dir, log_dir, resume=Fa
 
     start_epoch = 0
 
-    os.makedirs('log4_diff', exist_ok=True)
+    os.makedirs(SAVE_DIR, exist_ok=True)
 
     for epoch in range(start_epoch, epochs):
-        # Warm-up: large lambda for first 500 epochs to prevent posterior collapse
+        # Warm-up: no bpp for first 500 epochs, then normal R-D
         if epoch < 500:
-            rd_criterion.lmbda = 10.0
+            rd_criterion.use_bpp = False
         else:
+            rd_criterion.use_bpp = True
             rd_criterion.lmbda = 0.1
 
         train_one_epoch(nll_module_I, nll_module_P, rd_criterion, train_dataloader, optimizer_P, aux_optimizer_P, optimizer_nll_P, 0, tb_writer, clip_max_norm=1.0)
