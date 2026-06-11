@@ -16,6 +16,8 @@ SCALES_MIN = 0.11
 SCALES_MAX = 256
 SCALES_LEVELS = 64
 
+EVAL_DDIM_STEPS = 20
+
 
 
 def patchify_to_batch(x: torch.Tensor, r: int) -> torch.Tensor:
@@ -548,14 +550,14 @@ class NearLosslessCompressor_I(nn.Module):
         }
 
 
-    def load_state_dict(self, state_dict):
+    def load_state_dict(self, state_dict, strict=True):
         update_registered_buffers(
             self.lossy_compressor.gaussian_conditional,
             "lossy_compressor.gaussian_conditional",
             ["_quantized_cdf", "_offset", "_cdf_length", "scale_table"],
             state_dict,
         )
-        super().load_state_dict(state_dict)
+        return super().load_state_dict(state_dict, strict=strict)
 
     def parameters_wo_cond(self):
         parameters = (
@@ -583,7 +585,7 @@ class NearLosslessCompressor_P(nn.Module):
         # self.lossy_compressor = LossyCompressor_P(num_ch)
         self.lossy_compressor = LossyCompressor_P_diff_sit(num_ch, embed_dim=32)
         self.mask_conv = maskedconv7x7_parallel(1, 256, mask_type)
-        self.residual_compressor = ResidualCompressor(256, 5)
+        self.residual_compressor = DiffusionLMMHead(cond_ch=256, num_mixtures=5)
         self.fusion = conv1x1(256 * 2, 256)
 
         self.residual_compressor_cond = ResidualCompressor_cond(256, 5, cond_num)
@@ -642,22 +644,25 @@ class NearLosslessCompressor_P(nn.Module):
         }
 
 
-    def load_state_dict(self, state_dict):
+    def load_state_dict(self, state_dict, strict=True):
         update_registered_buffers(
             self.lossy_compressor.gaussian_conditional,
             "lossy_compressor.gaussian_conditional",
             ["_quantized_cdf", "_offset", "_cdf_length", "scale_table"],
             state_dict,
         )
-        super().load_state_dict(state_dict)
+        return super().load_state_dict(state_dict, strict=strict)
 
     def parameters_wo_cond(self):
         parameters = (
             p
             for n, p in self.named_parameters()
-            if not n.endswith(".quantiles") and not n.startswith("residual_compressor_cond.") and not n.startswith("fusion_cond.")
+            if not n.endswith(".quantiles")
+            and not n.startswith("residual_compressor_cond.")
+            and not n.startswith("fusion_cond.")
+            and not n.startswith("residual_compressor.teacher.")
         )
-    
+
         return parameters
 
     def parameters_w_cond(self):
@@ -666,7 +671,7 @@ class NearLosslessCompressor_P(nn.Module):
             for n, p in self.named_parameters()
             if not n.endswith(".quantiles") and (n.startswith("residual_compressor_cond.") or n.startswith("fusion_cond."))
         )
-    
+
         return parameters
 
 
@@ -1086,7 +1091,7 @@ class LossyCompressor_P_diff_sit(CompressionModel):
                 "diffusion_loss": diff_loss,
             }
         else:
-            x_hat, feat = self.ddim_sample(x.shape, context_feats, ref_feats, sample_steps=20)
+            x_hat, feat = self.ddim_sample(x.shape, context_feats, ref_feats, sample_steps=EVAL_DDIM_STEPS)
             res_prior = self.res_prior_head(feat)
             x_hat = ((x_hat.clamp(-1, 1) + 1) / 2) * nii_max_f
 
@@ -1113,7 +1118,9 @@ class LossyCompressor_P_diff_sit(CompressionModel):
 
         return {"img_strings": [y_strings, z_strings], "shape": z.size()[-4:]}
 
-    def decompress(self, strings, shape, pre, sample_steps=20):
+    def decompress(self, strings, shape, pre, sample_steps=None):
+        if sample_steps is None:
+            sample_steps = EVAL_DDIM_STEPS
         ref = pre / nii_max_f * 2 - 1
 
         z_hat = self.entropy_bottleneck.decompress(strings[1], shape[2:], shape[:2])
@@ -1144,3 +1151,203 @@ class LossyCompressor_P_diff_sit(CompressionModel):
         updated = self.gaussian_conditional.update_scale_table(scale_table, force=force)
         updated |= super().update(force=force)
         return updated
+
+
+# ============================================================================
+# DiffusionLMMHead: condition-diffusion replacement for ResidualCompressor
+# ============================================================================
+
+
+class LMM_UNet(nn.Module):
+    """Lightweight conditional U-Net inside DiffusionLMMHead.
+
+    Predicts clean LMM-parameter tensor (x-prediction) from a noised
+    parameter tensor and a conditioning feature map.
+    """
+
+    def __init__(self, params_ch=20, cond_ch=256, base_dim=64):
+        super().__init__()
+        time_dim = base_dim
+        self.time_mlp = nn.Sequential(
+            nn.Linear(1, base_dim * 4),
+            nn.GELU(),
+            nn.Linear(base_dim * 4, time_dim),
+        )
+
+        self.conv_in = nn.Conv2d(params_ch + cond_ch, base_dim, 3, padding=1)
+
+        self.down1 = CDC_ResnetBlock(base_dim, base_dim, time_dim)
+        self.down1_sample = CDC_Downsample(base_dim, base_dim * 2)
+        self.down2 = CDC_ResnetBlock(base_dim * 2, base_dim * 2, time_dim)
+        self.down2_sample = CDC_Downsample(base_dim * 2, base_dim * 4)
+
+        self.mid_block1 = CDC_ResnetBlock(base_dim * 4, base_dim * 4, time_dim)
+        self.mid_block2 = CDC_ResnetBlock(base_dim * 4, base_dim * 4, time_dim)
+
+        self.up2_sample = CDC_Upsample(base_dim * 4, base_dim * 2)
+        self.up2 = CDC_ResnetBlock(base_dim * 2 * 2, base_dim * 2, time_dim)
+        self.up1_sample = CDC_Upsample(base_dim * 2, base_dim)
+        self.up1 = CDC_ResnetBlock(base_dim * 2, base_dim, time_dim)
+
+        self.conv_out = nn.Sequential(
+            CDC_LayerNorm(base_dim),
+            nn.Conv2d(base_dim, params_ch, 3, padding=1),
+        )
+
+    def forward(self, params_t, time, cond):
+        H, W = params_t.shape[-2:]
+        pad_h = (4 - H % 4) % 4
+        pad_w = (4 - W % 4) % 4
+        if pad_h or pad_w:
+            params_t = F.pad(params_t, (0, pad_w, 0, pad_h), mode='replicate')
+            cond = F.pad(cond, (0, pad_w, 0, pad_h), mode='replicate')
+
+        t = self.time_mlp(time)
+
+        x = torch.cat([params_t, cond], dim=1)
+        x = self.conv_in(x)
+
+        d1 = self.down1(x, t)
+        x = self.down1_sample(d1)
+        d2 = self.down2(x, t)
+        x = self.down2_sample(d2)
+
+        x = self.mid_block1(x, t)
+        x = self.mid_block2(x, t)
+
+        x = self.up2_sample(x)
+        x = torch.cat([x, d2], dim=1)
+        x = self.up2(x, t)
+        x = self.up1_sample(x)
+        x = torch.cat([x, d1], dim=1)
+        x = self.up1(x, t)
+
+        out = self.conv_out(x)
+        if pad_h or pad_w:
+            out = out[..., :H, :W]
+        return out
+
+
+class DiffusionLMMHead(nn.Module):
+    """Drop-in replacement for ResidualCompressor (eval mirror).
+
+    Generates LMM parameters by running K-step DDIM reverse sampling
+    conditioned on res_prior_context. Public interface
+    (forward(cond) -> [B, 4*num_mixtures, H, W]) matches ResidualCompressor.
+
+    bit-exact: eta=0, deterministic-seed start noise, fp32 throughout.
+    """
+
+    def __init__(self, cond_ch=256, num_mixtures=5, num_timesteps=200,
+                 sample_steps=3, base_dim=64, noise_seed=20260526,
+                 *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.params_ch = 4 * num_mixtures
+        self.num_timesteps = num_timesteps
+        self.sample_steps = sample_steps
+        self.noise_seed = noise_seed
+
+        self.unet = LMM_UNet(
+            params_ch=self.params_ch,
+            cond_ch=cond_ch,
+            base_dim=base_dim,
+        )
+
+        self.teacher = ResidualCompressor(cond_ch, num_mixtures)
+        for p in self.teacher.parameters():
+            p.requires_grad_(False)
+        self._teacher_enabled = True
+
+        to_torch = partial(torch.tensor, dtype=torch.float32)
+        betas = _cosine_beta_schedule(num_timesteps)
+        alphas = 1.0 - betas
+        alphas_cumprod = np.cumprod(alphas, axis=0)
+
+        self.register_buffer("alphas_cumprod", to_torch(alphas_cumprod))
+        self.register_buffer("sqrt_alphas_cumprod", to_torch(np.sqrt(alphas_cumprod)))
+        self.register_buffer("sqrt_one_minus_alphas_cumprod",
+                             to_torch(np.sqrt(1.0 - alphas_cumprod)))
+
+        self.last_diff_loss = None
+
+    def disable_teacher(self):
+        self._teacher_enabled = False
+
+    def enable_teacher(self):
+        self._teacher_enabled = True
+
+    def load_teacher(self, teacher_state_dict):
+        self.teacher.load_state_dict(teacher_state_dict, strict=True)
+        for p in self.teacher.parameters():
+            p.requires_grad_(False)
+
+    def _q_sample(self, x_start, t, noise):
+        return (
+            _extract(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start
+            + _extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * noise
+        )
+
+    def _deterministic_noise(self, shape, device):
+        gen = torch.Generator(device=device)
+        gen.manual_seed(self.noise_seed)
+        return torch.randn(shape, generator=gen, device=device, dtype=torch.float32)
+
+    def _ddim_reverse(self, cond):
+        B, _, H, W = cond.shape
+        device = cond.device
+        shape = (B, self.params_ch, H, W)
+
+        sample_steps = self.sample_steps
+        if sample_steps != 1:
+            indice = torch.linspace(0, self.num_timesteps - 1, sample_steps,
+                                    device=device).long()
+        else:
+            indice = torch.tensor([self.num_timesteps - 1], device=device).long()
+
+        alphas_cumprod = self.alphas_cumprod[indice]
+        alphas_cumprod_prev = F.pad(alphas_cumprod[:-1], (1, 0), value=1.0)
+        sqrt_alphas_cumprod_prev = torch.sqrt(alphas_cumprod_prev)
+        sqrt_one_minus_alphas_cumprod_prev = torch.sqrt(1.0 - alphas_cumprod_prev)
+
+        params_t = self._deterministic_noise(shape, device)
+
+        last_step = 0
+        for i in reversed(range(sample_steps)):
+            use_grad = self.training and (i == last_step)
+            grad_ctx = nullcontext() if use_grad else torch.no_grad()
+            with grad_ctx:
+                t_idx = torch.full((B,), i, device=device, dtype=torch.long)
+                time_val = indice[i].float().unsqueeze(0).unsqueeze(-1) / self.num_timesteps
+                time_input = time_val.expand(B, -1)
+
+                params_pred = self.unet(params_t, time_input, cond)
+
+                sqrt_recip = torch.sqrt(1.0 / _extract(alphas_cumprod, t_idx, params_t.shape))
+                sqrt_recipm1 = torch.sqrt(1.0 / _extract(alphas_cumprod, t_idx, params_t.shape) - 1)
+                noise_pred = (sqrt_recip * params_t - params_pred) / sqrt_recipm1
+
+                params_t = (
+                    _extract(sqrt_alphas_cumprod_prev, t_idx, params_t.shape) * params_pred
+                    + _extract(sqrt_one_minus_alphas_cumprod_prev, t_idx, params_t.shape) * noise_pred
+                )
+            if not use_grad:
+                params_t = params_t.detach()
+
+        return params_t
+
+    def forward(self, cond):
+        if self.training and self._teacher_enabled:
+            with torch.no_grad():
+                gt_params = self.teacher(cond)
+            B = cond.shape[0]
+            t = torch.randint(0, self.num_timesteps, (B,), device=cond.device).long()
+            noise = torch.randn_like(gt_params)
+            params_noisy = self._q_sample(gt_params, t, noise)
+            time_input = t.float().unsqueeze(-1) / self.num_timesteps
+            params_pred = self.unet(params_noisy, time_input, cond)
+            self.last_diff_loss = F.mse_loss(params_pred, gt_params)
+            return gt_params.detach()
+
+        params_0 = self._ddim_reverse(cond)
+        self.last_diff_loss = None
+        return params_0

@@ -1,8 +1,10 @@
 import os
 os.environ['CUDA_VISIBLE_DEVICES'] = '3'
+os.environ['TMPDIR'] = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'tmp')
+os.makedirs(os.environ['TMPDIR'], exist_ok=True)
 
 # ============ 路径配置 ============
-SAVE_DIR = "log4_diff_warmup_nobpp500"
+SAVE_DIR_DEFAULT = "log4_diff_warmup_nobpp200"
 # =================================
 
 import torch
@@ -130,10 +132,11 @@ class Dataset_test():
 
 class RateDistortion_diff(nn.Module):
     """Modified RateDistortion that uses diffusion_loss instead of MSE."""
-    def __init__(self, lmbda=0.1, use_bpp=True):
+    def __init__(self, lmbda=0.1, use_bpp=True, lmbda_diff_lmm=0.05):
         super().__init__()
         self.lmbda = lmbda
         self.use_bpp = use_bpp
+        self.lmbda_diff_lmm = lmbda_diff_lmm
         self.mse = nn.MSELoss()
 
     def forward(self, output, target):
@@ -154,10 +157,18 @@ class RateDistortion_diff(nn.Module):
             x_hat = torch.clamp(output["x_hat"], min=-0.5, max=nii_max_f + 0.5)
             out["mse_loss"] = self.mse(x_hat, target)
 
+        out["diff_lmm_loss"] = output.get("diff_lmm_loss",
+                                          torch.zeros((), device=target.device))
+
         if self.use_bpp:
-            out["loss"] = self.lmbda * out["mse_loss"] + out["img_bpp"] + out["res_bpp"]
+            out["loss"] = (
+                self.lmbda * out["mse_loss"]
+                + out["img_bpp"]
+                + out["res_bpp"]
+                + self.lmbda_diff_lmm * out["diff_lmm_loss"]
+            )
         else:
-            out["loss"] = out["mse_loss"]
+            out["loss"] = out["mse_loss"] + self.lmbda_diff_lmm * out["diff_lmm_loss"]
 
         return out
 
@@ -174,8 +185,10 @@ def train_one_epoch(model_I, model_P, criterion, train_dataloader, optimizer_P, 
         lastframe = None
         for i in range(1, 8):
             optimizer_P.zero_grad()
-            aux_optimizer_P.zero_grad()
-            optimizer_nll_P.zero_grad()
+            if aux_optimizer_P is not None:
+                aux_optimizer_P.zero_grad()
+            if optimizer_nll_P is not None:
+                optimizer_nll_P.zero_grad()
             if i == 1:
                 inp = patchify_to_batch(x[:, 0], 64)
                 out = model_I(inp, tau)
@@ -191,17 +204,32 @@ def train_one_epoch(model_I, model_P, criterion, train_dataloader, optimizer_P, 
                 nn.utils.clip_grad_norm_(model_P.parameters_wo_cond(), clip_max_norm)
             optimizer_P.step()
 
-            out_criterion["res_bpp_cond"].backward()
-            if clip_max_norm:
-                nn.utils.clip_grad_norm_(model_P.parameters_w_cond(), clip_max_norm)
-            optimizer_nll_P.step()
+            if optimizer_nll_P is not None:
+                out_criterion["res_bpp_cond"].backward()
+                if clip_max_norm:
+                    nn.utils.clip_grad_norm_(model_P.parameters_w_cond(), clip_max_norm)
+                optimizer_nll_P.step()
 
-            aux_loss = model_P.lossy_compressor.aux_loss()
-            aux_loss.backward()
-            aux_optimizer_P.step()
+            if aux_optimizer_P is not None:
+                aux_loss = model_P.lossy_compressor.aux_loss()
+                aux_loss.backward()
+                aux_optimizer_P.step()
+
+            if tb_writer is not None and train_step % 50 == 0:
+                tb_writer.add_scalar("train/loss", float(out_criterion["loss"].detach()), train_step)
+                tb_writer.add_scalar("train/img_bpp", float(out_criterion["img_bpp"].detach()), train_step)
+                tb_writer.add_scalar("train/res_bpp", float(out_criterion["res_bpp"].detach()), train_step)
+                if "diff_lmm_loss" in out_criterion:
+                    tb_writer.add_scalar("train/diff_lmm_loss",
+                                         float(out_criterion["diff_lmm_loss"].detach()
+                                               if hasattr(out_criterion["diff_lmm_loss"], "detach")
+                                               else out_criterion["diff_lmm_loss"]),
+                                         train_step)
+            train_step += 1
+    return train_step
 
 
-def eval_epoch(model_I, model_P, criterion, eval_dataloader, epoch, tb_writer=None):
+def eval_epoch(model_I, model_P, criterion, eval_dataloader, epoch, save_dir, tb_writer=None):
 
     model_I.eval()
     model_P.eval()
@@ -237,14 +265,23 @@ def eval_epoch(model_I, model_P, criterion, eval_dataloader, epoch, tb_writer=No
     res_bpp_p /= eval_size * 7
     res_bpp_cond_p /= eval_size * 7
 
-    torch.save(model_P.state_dict(), f'{SAVE_DIR}/p-Ep{epoch + 1}-{img_bpp_p:.3f}-{img_bpp_p + res_bpp_p:.3f}-{img_bpp_p + res_bpp_cond_p:.3f}.pth')
+    torch.save(model_P.state_dict(), f'{save_dir}/p-Ep{epoch + 1}-{img_bpp_p:.3f}-{img_bpp_p + res_bpp_p:.3f}-{img_bpp_p + res_bpp_cond_p:.3f}.pth')
 
 
-def train(train_dataloader, eval_dataloader, epochs, ckp_dir, log_dir, resume=False):
+def train(train_dataloader, eval_dataloader, epochs, ckp_dir, log_dir, resume_ckp=None, stage="A", save_dir=SAVE_DIR_DEFAULT, start_epoch_override=None):
     nll_module_I = NearLosslessCompressor_I(192, 5, "3P").cuda()
     nll_module_P = NearLosslessCompressor_P(192, 5, "3P").cuda()
 
-    rd_criterion = RateDistortion_diff(lmbda=0.1)
+    stage = stage.upper()
+    print(f"[stage] running STAGE={stage}")
+    if stage == "A":
+        rd_criterion = RateDistortion_diff(lmbda=0.0, use_bpp=False, lmbda_diff_lmm=1.0)
+    elif stage == "B":
+        rd_criterion = RateDistortion_diff(lmbda=0.0, use_bpp=True, lmbda_diff_lmm=0.0)
+    elif stage == "C":
+        rd_criterion = RateDistortion_diff(lmbda=0.1, use_bpp=True, lmbda_diff_lmm=0.0)
+    else:
+        raise ValueError(f"Unknown stage={stage}")
 
     # Load frozen I-frame model
     ckp = torch.load(os.path.join(ckp_dir, "ckp_nll/0001/ckp.tar"))
@@ -260,38 +297,139 @@ def train(train_dataloader, eval_dataloader, epochs, ckp_dir, log_dir, resume=Fa
         new_state_dict[new_k] = v
     nll_module_I.load_state_dict(new_state_dict)
 
-    optimizer_P, aux_optimizer_P, optimizer_nll_P = configure_optimizers(nll_module_P, lr=1e-4, aux_lr=1e-3)
+    # Resume from checkpoint if provided
+    start_epoch = 0
+    if resume_ckp is not None and os.path.isfile(resume_ckp):
+        print(f"Resuming from checkpoint: {resume_ckp}")
+        ckp_p = torch.load(resume_ckp, weights_only=False)
+        # Backward-compatible loader: accept either a bare state_dict or a wrapper.
+        if isinstance(ckp_p, dict) and "model_state_dict" in ckp_p and not any(
+            k.startswith(("lossy_compressor.", "mask_conv.", "residual_compressor"))
+            for k in ckp_p.keys()
+        ):
+            ckp_state = ckp_p["model_state_dict"]
+        else:
+            ckp_state = ckp_p
+        nll_module_P.load_state_dict(ckp_state)
+        # Parse epoch from filename: p-Ep{epoch}-xxx-xxx-xxx.pth
+        basename = os.path.basename(resume_ckp)
+        try:
+            ep_str = basename.split('-')[1]  # "Ep123"
+            start_epoch = int(ep_str.replace('Ep', ''))
+            print(f"Resuming from epoch {start_epoch} (parsed from filename)")
+        except (IndexError, ValueError):
+            start_epoch = 0
+            print(f"Could not parse epoch from filename '{basename}', starting at epoch 0")
+    if start_epoch_override is not None:
+        start_epoch = int(start_epoch_override)
+        print(f"start_epoch overridden via --start-epoch: {start_epoch}")
 
-    scheduler_P = optim.lr_scheduler.MultiStepLR(optimizer_P, milestones=[350, 390, 430, 470, 510, 550, 590], gamma=0.9, verbose=True)
-    scheduler_nll_P = optim.lr_scheduler.MultiStepLR(optimizer_nll_P, milestones=[350, 390, 430, 470, 510, 550, 590], gamma=0.9, verbose=True)
+    # === Per-stage freeze / unfreeze ===
+    if stage == "A":
+        for p in nll_module_P.parameters():
+            p.requires_grad_(False)
+        for p in nll_module_P.residual_compressor.unet.parameters():
+            p.requires_grad_(True)
+        nll_module_P.residual_compressor.enable_teacher()
+    elif stage == "B":
+        for p in nll_module_P.parameters():
+            p.requires_grad_(False)
+        for p in nll_module_P.residual_compressor.unet.parameters():
+            p.requires_grad_(True)
+        nll_module_P.residual_compressor.disable_teacher()
+    elif stage == "C":
+        for p in nll_module_P.parameters():
+            p.requires_grad_(True)
+        for p in nll_module_P.residual_compressor.teacher.parameters():
+            p.requires_grad_(False)
+        nll_module_P.residual_compressor.disable_teacher()
+
+    n_trainable = sum(p.numel() for p in nll_module_P.parameters() if p.requires_grad)
+    n_total = sum(p.numel() for p in nll_module_P.parameters())
+    print(f"[stage {stage}] trainable params: {n_trainable:,} / {n_total:,}")
+
+    # === Per-stage optimizers ===
+    if stage == "A":
+        # Only train residual_compressor.unet; no cond head, no aux update.
+        optimizer_P = optim.Adam(
+            [p for p in nll_module_P.parameters_wo_cond() if p.requires_grad],
+            lr=1e-4,
+        )
+        aux_optimizer_P = None
+        optimizer_nll_P = None
+    elif stage == "B":
+        # Same partitioning as default; aux still relevant for entropy bottleneck.
+        optimizer_P = optim.Adam(
+            [p for p in nll_module_P.parameters_wo_cond() if p.requires_grad],
+            lr=1e-4,
+        )
+        aux_params = [
+            p for n, p in nll_module_P.lossy_compressor.named_parameters()
+            if n.endswith(".quantiles") and p.requires_grad
+        ]
+        aux_optimizer_P = optim.Adam(aux_params, lr=1e-3) if aux_params else None
+        optimizer_nll_P = None
+    else:  # stage == "C"
+        optimizer_P, aux_optimizer_P, optimizer_nll_P = configure_optimizers(
+            nll_module_P, lr=1e-5, aux_lr=1e-3
+        )
+
+    scheduler_P = optim.lr_scheduler.MultiStepLR(
+        optimizer_P, milestones=[350, 390, 430, 470, 510, 550, 590], gamma=0.9, verbose=True
+    )
+    scheduler_nll_P = (
+        optim.lr_scheduler.MultiStepLR(
+            optimizer_nll_P, milestones=[350, 390, 430, 470, 510, 550, 590], gamma=0.9, verbose=True
+        )
+        if optimizer_nll_P is not None else None
+    )
+
+    # Fast-forward LR schedulers to start_epoch so resumed runs see the
+    # correct learning rate (MultiStepLR has no notion of "where we are"
+    # other than .step() count).
+    for _ in range(start_epoch):
+        scheduler_P.step()
+        if scheduler_nll_P is not None:
+            scheduler_nll_P.step()
     tb_writer = SummaryWriter(log_dir)
 
-    start_epoch = 0
+    os.makedirs(save_dir, exist_ok=True)
 
-    os.makedirs(SAVE_DIR, exist_ok=True)
-
+    train_step = 0
     for epoch in range(start_epoch, epochs):
-        # Warm-up: no bpp for first 500 epochs, then normal R-D
-        if epoch < 500:
-            rd_criterion.use_bpp = False
-        else:
-            rd_criterion.use_bpp = True
-            rd_criterion.lmbda = 0.1
-
-        train_one_epoch(nll_module_I, nll_module_P, rd_criterion, train_dataloader, optimizer_P, aux_optimizer_P, optimizer_nll_P, 0, tb_writer, clip_max_norm=1.0)
-        if epoch > 0 and epoch % 30 == 0:
-            eval_epoch(nll_module_I, nll_module_P, rd_criterion, eval_dataloader, epoch, tb_writer)
+        # Stage A always uses diff_lmm_loss only (no bpp). Stage B/C use bpp from epoch 0.
+        # The legacy 200-epoch warm-up only applied to the original MSE+bpp recipe; in
+        # Stage A/B/C the criterion is already correctly configured above, so leave it.
+        train_step = train_one_epoch(
+            nll_module_I, nll_module_P, rd_criterion, train_dataloader,
+            optimizer_P, aux_optimizer_P, optimizer_nll_P,
+            train_step, tb_writer, clip_max_norm=1.0,
+        )
+        if epoch % 50 == 0:
+            print(f"[Epoch {epoch}] Starting evaluation...")
+            eval_epoch(nll_module_I, nll_module_P, rd_criterion, eval_dataloader, epoch, save_dir, tb_writer)
 
         scheduler_P.step()
-        scheduler_nll_P.step()
+        if scheduler_nll_P is not None:
+            scheduler_nll_P.step()
 
     tb_writer.close()
 
 
 if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--resume', type=str, default=None, help='Path to checkpoint .pth file to resume training')
+    parser.add_argument('--stage', type=str, default="A", choices=["A", "B", "C"],
+                        help='Training stage: A=self-distill warmup, B=joint finetune, C=end-to-end')
+    parser.add_argument('--epochs', type=int, default=10000, help='Total epoch budget')
+    parser.add_argument('--save-dir', type=str, default=SAVE_DIR_DEFAULT,
+                        help='Directory to save ckpt files for THIS run (Stage A/B/C should use different dirs)')
+    parser.add_argument('--start-epoch', type=int, default=None,
+                        help='Override start epoch (otherwise parsed from --resume filename p-Ep{N}-...pth)')
+    args = parser.parse_args()
 
-    epochs = 10000
-    resume = False
+    epochs = args.epochs
 
     seed = 0
     torch.manual_seed(seed)
@@ -308,4 +446,36 @@ if __name__ == "__main__":
     train_dataloader = data.DataLoader(train_dataset, batch_size=1, shuffle=True, num_workers=8, prefetch_factor=2, pin_memory=True)
     eval_dataloader = data.DataLoader(test_dataset, batch_size=1, shuffle=False, num_workers=8, prefetch_factor=2, pin_memory=True)
 
-    train(train_dataloader, eval_dataloader, epochs, ckp_dir, log_dir, resume)
+    train(train_dataloader, eval_dataloader, epochs, ckp_dir, log_dir,
+          resume_ckp=args.resume, stage=args.stage, save_dir=args.save_dir,
+          start_epoch_override=args.start_epoch)
+
+
+# ============================================================================
+# Pipeline (run from DLPR-Mosmed-nll/, in order):
+#
+# (0) Prepare Stage-A starting ckp from a baseline (old ResidualCompressor head):
+#     python init_diff_lmm_from_baseline.py \
+#         --old-ckp ./log4/p-Ep1251-0.005-4.796-5.067.pth \
+#         --new-ckp ./log4/p_init_with_teacher.pth
+#
+# (1) Stage A — self-distillation warmup (unet learns to copy teacher):
+#     python train4_diff_sit.py --stage A \
+#         --resume ./log4/p_init_with_teacher.pth \
+#         --save-dir log4_warmup_stageA --epochs 20000
+#
+# (2) Stage B — joint finetune with res_bpp loss, teacher off, K=3 DDIM (truncated BPTT):
+#     python train4_diff_sit.py --stage B \
+#         --resume ./log4_warmup_stageA/p-Ep501-0.005-5.102-5.065.pth \
+#         --save-dir log4_warmup_stageB --epochs 20000
+#
+# (3) Stage C — end-to-end finetune, lr=1e-5:
+#     python train4_diff_sit.py --stage C \
+#         --resume ./log4_warmup_stageB/p-Ep{}-{}-{}-{}.pth \
+#         --save-dir log4_warmup_stageC --epochs 20000
+#
+# Resume mid-stage: just re-point --resume to the latest p-Ep{N}-...pth in the
+# same --save-dir; start_epoch is parsed from the filename and the LR scheduler
+# is fast-forwarded to match. Use --start-epoch N if your filename does not
+# follow the p-Ep{N}-...pth convention.
+# ============================================================================

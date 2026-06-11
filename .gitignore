@@ -1,12 +1,17 @@
 # Python
 __pycache__/
 *.pyc
+.ruff_cache/
 
 # Jupyter
 .ipynb_checkpoints/
 
+# Local assistants / editor state
+.claude/
+
 # Checkpoints & models
 ckp_nll*/
+ckp_nll-*/
 log4/
 log4_diff/
 *.pth
@@ -20,3 +25,12 @@ oldlog/
 
 # TensorBoard
 events.out.tfevents.*
+
+# Temporary/runtime files
+tmp/
+
+# Generated diagnostics
+residual_diag*.png
+residual_diag*.csv
+*.png
+*.csv

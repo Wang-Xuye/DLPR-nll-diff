@@ -382,8 +382,13 @@ def convert_old_keys(state_dict):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--tau", type=int, default=1, help="near-lossless constraint (0, 1, 2, 3, ...)")
+    parser.add_argument("--steps", type=int, default=20, help="DDIM sample steps used during evaluation")
     args = parser.parse_args()
     tau = args.tau
+
+    import nll_model_eval_p as _nme
+    _nme.EVAL_DDIM_STEPS = args.steps
+    print(f"[info] EVAL_DDIM_STEPS set to {args.steps}")
 
     dset = Dataset(DATA_PATH)
     device = torch.device('cuda')
