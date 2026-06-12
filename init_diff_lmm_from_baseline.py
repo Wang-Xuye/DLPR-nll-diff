@@ -34,12 +34,13 @@ from compressai.models.utils import update_registered_buffers
 from nll_model_p import NearLosslessCompressor_P
 
 
-def main(old_ckp_path: str, new_ckp_path: str, num_ch: int = 192, cond_num: int = 5):
+def main(old_ckp_path: str, new_ckp_path: str, num_ch: int = 192,
+         cond_num: int = 5, context_type: str = "simple"):
     if not os.path.isfile(old_ckp_path):
         raise FileNotFoundError(f"Baseline ckp not found: {old_ckp_path}")
 
     print(f"[1/4] Building NearLosslessCompressor_P (DiffusionLMMHead version) ...")
-    model = NearLosslessCompressor_P(num_ch, cond_num, "3P")
+    model = NearLosslessCompressor_P(num_ch, cond_num, "3P", context_type=context_type)
 
     print(f"[2/4] Loading baseline ckp: {old_ckp_path}")
     old_sd = torch.load(old_ckp_path, map_location="cpu", weights_only=False)
@@ -73,6 +74,13 @@ def main(old_ckp_path: str, new_ckp_path: str, num_ch: int = 192, cond_num: int 
         if k.startswith("residual_compressor.")
         and not k.startswith("residual_compressor_cond.")
     }
+    fusion_sd = {
+        k[len("fusion."):]: v
+        for k, v in old_sd.items()
+        if k.startswith("fusion.")
+    }
+    if context_type == "diffusion_fusion" and not fusion_sd:
+        raise RuntimeError("Old ckp has no `fusion.*` keys; cannot initialize diffusion_fusion teacher.")
 
     print(f"[3/4] Loading non-residual weights into the new model (strict=False) ...")
     remain_sd = {
@@ -111,7 +119,12 @@ def main(old_ckp_path: str, new_ckp_path: str, num_ch: int = 192, cond_num: int 
           f" unet={n_unet}, teacher={n_teacher}, buffers/other={n_buffers}")
 
     print(f"[4/4] Loading baseline residual_compressor weights into DiffusionLMMHead.teacher ...")
-    model.residual_compressor.load_teacher(teacher_sd)
+    if context_type == "simple":
+        model.residual_compressor.load_teacher(teacher_sd)
+    elif context_type == "diffusion_fusion":
+        model.residual_compressor.load_teacher(fusion_sd, teacher_sd)
+    else:
+        raise ValueError(f"Unsupported context_type={context_type!r}")
     teacher_grad = any(p.requires_grad for p in model.residual_compressor.teacher.parameters())
     assert not teacher_grad, "teacher must be frozen after load_teacher()"
 
@@ -131,6 +144,9 @@ if __name__ == "__main__":
                         help="Output ckp for Stage A warmup.")
     parser.add_argument("--num-ch", type=int, default=192)
     parser.add_argument("--cond-num", type=int, default=5)
+    parser.add_argument("--context-type", type=str, default="simple",
+                        choices=["simple", "diffusion_fusion"])
     args = parser.parse_args()
 
-    main(args.old_ckp, args.new_ckp, num_ch=args.num_ch, cond_num=args.cond_num)
+    main(args.old_ckp, args.new_ckp, num_ch=args.num_ch, cond_num=args.cond_num,
+         context_type=args.context_type)

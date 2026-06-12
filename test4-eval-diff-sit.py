@@ -194,8 +194,7 @@ def compress(model, input_img, COT, tau=0, patch_sz=64, mix_num=5, last_frame=No
             res_tmp_crop = res_tmp_crop.unsqueeze(3)
 
             if tau == 0:
-                rp_ctx = model.fusion(torch.cat((rp, ctx), 1))
-                lmm_params = model.residual_compressor(rp_ctx)
+                lmm_params = lmm_params_from_context(model, rp, ctx)
                 mu, log_sigma, coeffs, weights = torch.split(lmm_params, 5, dim=1)
                 coeffs = torch.tanh(coeffs)
             elif tau > 0:
@@ -248,6 +247,13 @@ def compress(model, input_img, COT, tau=0, patch_sz=64, mix_num=5, last_frame=No
     return code_lossy, code_res, img_shape, (res_q_min, res_q_max), psnr_rrr
 
 
+def lmm_params_from_context(model, res_prior, residual_context):
+    if hasattr(model, "_lmm_params_from_context"):
+        return model._lmm_params_from_context(res_prior, residual_context)
+    rp_ctx = model.fusion(torch.cat((res_prior, residual_context), 1))
+    return model.residual_compressor(rp_ctx)
+
+
 def decompress(model, code_lossy, code_res, img_shape, res_range, COT, tau=0, mix_num=5, patch_sz=64, last_frame=None):
     global declossytime
     global decrestime
@@ -297,8 +303,7 @@ def decompress(model, code_lossy, code_res, img_shape, res_range, COT, tau=0, mi
             res_crop = res_tmp[:, :, h_idx, w_idx].unsqueeze(3)
 
             if tau == 0:
-                rp_ctx = model.fusion(torch.cat((rp, ctx), 1))
-                lmm_params = model.residual_compressor(rp_ctx)
+                lmm_params = lmm_params_from_context(model, rp, ctx)
                 mu, log_sigma, coeffs, weights = torch.split(lmm_params, 5, dim=1)
                 coeffs = torch.tanh(coeffs)
             elif tau > 0:
@@ -383,8 +388,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--tau", type=int, default=1, help="near-lossless constraint (0, 1, 2, 3, ...)")
     parser.add_argument("--steps", type=int, default=20, help="DDIM sample steps used during evaluation")
-    parser.add_argument("--context-type", type=str, default="simple", choices=["simple"],
-                        help='Residual context module type. "simple" is masked 7x7 conv + 1x1 fusion.')
+    parser.add_argument("--context-type", type=str, default="simple",
+                        choices=["simple", "diffusion_fusion"],
+                        help="Residual context module type.")
     args = parser.parse_args()
     tau = args.tau
 

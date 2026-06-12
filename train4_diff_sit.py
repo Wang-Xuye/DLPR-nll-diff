@@ -430,8 +430,9 @@ if __name__ == "__main__":
                         help='Directory to save ckpt files for THIS run (Stage A/B/C should use different dirs)')
     parser.add_argument('--start-epoch', type=int, default=None,
                         help='Override start epoch (otherwise parsed from --resume filename p-Ep{N}-...pth)')
-    parser.add_argument('--context-type', type=str, default="simple", choices=["simple"],
-                        help='Residual context module type. "simple" is masked 7x7 conv + 1x1 fusion.')
+    parser.add_argument('--context-type', type=str, default="simple",
+                        choices=["simple", "diffusion_fusion"],
+                        help='Residual context module type.')
     args = parser.parse_args()
 
     epochs = args.epochs

@@ -500,14 +500,19 @@ class NearLosslessCompressor_I(nn.Module):
 class NearLosslessCompressor_P(nn.Module):
     def __init__(self, num_ch, cond_num, mask_type="3P", context_type="simple", *args, **kwargs):
         super().__init__(*args, **kwargs)
-        if context_type != "simple":
-            raise ValueError(f"Unsupported context_type={context_type!r}; currently only 'simple' is implemented.")
+        if context_type not in ("simple", "diffusion_fusion"):
+            raise ValueError(f"Unsupported context_type={context_type!r}.")
         self.context_type = context_type
         # self.lossy_compressor = LossyCompressor_P(num_ch)
         self.lossy_compressor = LossyCompressor_P_diff_sit(num_ch, embed_dim=32)
         self.mask_conv = maskedconv7x7_parallel(1, 256, mask_type)
-        self.residual_compressor = DiffusionLMMHead(cond_ch=256, num_mixtures=5)
         self.fusion = conv1x1(256 * 2, 256)
+        if context_type == "simple":
+            self.residual_compressor = DiffusionLMMHead(cond_ch=256, num_mixtures=5)
+        else:
+            self.residual_compressor = DiffusionContextLMMHead(
+                prior_ch=256, context_ch=256, num_mixtures=5
+            )
 
         self.residual_compressor_cond = ResidualCompressor_cond(256, 5, cond_num)
         self.fusion_cond = Conv2d_cond(cond_num, 256 * 2, 256, kernel_size=1, bias=False)
@@ -518,6 +523,14 @@ class NearLosslessCompressor_P(nn.Module):
         if self.context_type == "simple":
             context = self.mask_conv(res_norm)
             return self.fusion(torch.cat((res_prior, context), 1))
+        raise RuntimeError(f"Unsupported context_type={self.context_type!r}")
+
+    def _lmm_params_from_context(self, res_prior, residual_context):
+        if self.context_type == "simple":
+            res_prior_context = self.fusion(torch.cat((res_prior, residual_context), 1))
+            return self.residual_compressor(res_prior_context)
+        if self.context_type == "diffusion_fusion":
+            return self.residual_compressor(res_prior, residual_context)
         raise RuntimeError(f"Unsupported context_type={self.context_type!r}")
 
 
@@ -535,9 +548,8 @@ class NearLosslessCompressor_P(nn.Module):
         res = input - x_hat
         res_n = res/nii_max_f*2
         
-        res_prior_context = self._residual_context(res_n, lossy_out["res_prior"])
-
-        lmm_params = self.residual_compressor(res_prior_context)
+        context = self.mask_conv(res_n)
+        lmm_params = self._lmm_params_from_context(lossy_out["res_prior"], context)
         mu, log_sigma, coeffs, weights = torch.split(lmm_params, 5, dim=1)
 
         lmm = LogisticMixtureModel(mu, log_sigma, weights, coeffs)
@@ -1265,3 +1277,49 @@ class DiffusionLMMHead(nn.Module):
         params_0 = self._ddim_reverse(cond)
         self.last_diff_loss = None
         return params_0
+
+
+class SimpleContextLMMTeacher(nn.Module):
+    """Simple causal context path used as the teacher for diffusion fusion."""
+
+    def __init__(self, prior_ch=256, context_ch=256, hidden_ch=256, num_mixtures=5):
+        super().__init__()
+        self.fusion = conv1x1(prior_ch + context_ch, hidden_ch)
+        self.residual_compressor = ResidualCompressor(hidden_ch, num_mixtures)
+
+    def forward(self, cond):
+        fused = self.fusion(cond)
+        return self.residual_compressor(fused)
+
+
+class DiffusionContextLMMHead(DiffusionLMMHead):
+    """Diffusion LMM head conditioned on lossy prior and causal residual context."""
+
+    def __init__(self, prior_ch=256, context_ch=256, num_mixtures=5,
+                 num_timesteps=200, sample_steps=3, base_dim=64,
+                 noise_seed=20260526, *args, **kwargs):
+        self.prior_ch = prior_ch
+        self.context_ch = context_ch
+        super().__init__(
+            cond_ch=prior_ch + context_ch,
+            num_mixtures=num_mixtures,
+            num_timesteps=num_timesteps,
+            sample_steps=sample_steps,
+            base_dim=base_dim,
+            noise_seed=noise_seed,
+            *args,
+            **kwargs,
+        )
+        self.teacher = SimpleContextLMMTeacher(prior_ch, context_ch, 256, num_mixtures)
+        for p in self.teacher.parameters():
+            p.requires_grad_(False)
+
+    def load_teacher(self, fusion_state_dict, residual_state_dict):
+        self.teacher.fusion.load_state_dict(fusion_state_dict, strict=True)
+        self.teacher.residual_compressor.load_state_dict(residual_state_dict, strict=True)
+        for p in self.teacher.parameters():
+            p.requires_grad_(False)
+
+    def forward(self, res_prior, residual_context):
+        cond = torch.cat((res_prior, residual_context), 1)
+        return super().forward(cond)
