@@ -391,6 +391,10 @@ if __name__ == "__main__":
     parser.add_argument("--context-type", type=str, default="simple",
                         choices=["simple", "diffusion_fusion"],
                         help="Residual context module type.")
+    parser.add_argument("--data-path", type=str, default=DATA_PATH)
+    parser.add_argument("--i-frame-ckp", type=str, default=I_FRAME_CKP)
+    parser.add_argument("--p-frame-ckp", type=str, default=P_FRAME_CKP)
+    parser.add_argument("--log-prefix", type=str, default=LOG_FILE_PREFIX)
     args = parser.parse_args()
     tau = args.tau
 
@@ -398,18 +402,18 @@ if __name__ == "__main__":
     _nme.EVAL_DDIM_STEPS = args.steps
     print(f"[info] EVAL_DDIM_STEPS set to {args.steps}")
 
-    dset = Dataset(DATA_PATH)
+    dset = Dataset(args.data_path)
     device = torch.device('cuda')
     nll_module_I = NearLosslessCompressor_I(192, 5).eval().to(device)
     nll_module_P = NearLosslessCompressor_P(192, 5, context_type=args.context_type).eval().to(device)
 
     # Load I-frame model
-    ckp_I = torch.load(I_FRAME_CKP, map_location=device, weights_only=False)
+    ckp_I = torch.load(args.i_frame_ckp, map_location=device, weights_only=False)
     nll_module_I.load_state_dict(ckp_I['model_state_dict'])
     nll_module_I.lossy_compressor.update(force=True)
 
     # Load P-frame model (diff-sit)
-    ckp_P = torch.load(P_FRAME_CKP, map_location=device, weights_only=False)
+    ckp_P = torch.load(args.p_frame_ckp, map_location=device, weights_only=False)
     ckp_P = remove_module_prefix(ckp_P, prefix="module.")
     ckp_P = convert_old_keys(ckp_P)
     nll_module_P.load_state_dict(ckp_P)
@@ -429,7 +433,7 @@ if __name__ == "__main__":
     p_lossy_bit = 0
     m_max_diff = 0
     COT = coding_order_table7x7()
-    log_file = '{}-{}.txt'.format(LOG_FILE_PREFIX, tau)
+    log_file = '{}-{}.txt'.format(args.log_prefix, tau)
 
     for filez in dset:
         data = filez
