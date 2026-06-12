@@ -498,8 +498,11 @@ class NearLosslessCompressor_I(nn.Module):
     
 
 class NearLosslessCompressor_P(nn.Module):
-    def __init__(self, num_ch, cond_num, mask_type="3P", *args, **kwargs):
+    def __init__(self, num_ch, cond_num, mask_type="3P", context_type="simple", *args, **kwargs):
         super().__init__(*args, **kwargs)
+        if context_type != "simple":
+            raise ValueError(f"Unsupported context_type={context_type!r}; currently only 'simple' is implemented.")
+        self.context_type = context_type
         # self.lossy_compressor = LossyCompressor_P(num_ch)
         self.lossy_compressor = LossyCompressor_P_diff_sit(num_ch, embed_dim=32)
         self.mask_conv = maskedconv7x7_parallel(1, 256, mask_type)
@@ -510,6 +513,12 @@ class NearLosslessCompressor_P(nn.Module):
         self.fusion_cond = Conv2d_cond(cond_num, 256 * 2, 256, kernel_size=1, bias=False)
 
         self.cond_num = cond_num
+
+    def _residual_context(self, res_norm, res_prior):
+        if self.context_type == "simple":
+            context = self.mask_conv(res_norm)
+            return self.fusion(torch.cat((res_prior, context), 1))
+        raise RuntimeError(f"Unsupported context_type={self.context_type!r}")
 
 
     def forward(self, input, pre, tau):
@@ -526,8 +535,7 @@ class NearLosslessCompressor_P(nn.Module):
         res = input - x_hat
         res_n = res/nii_max_f*2
         
-        context = self.mask_conv(res_n)
-        res_prior_context = self.fusion(torch.cat((lossy_out["res_prior"], context), 1))
+        res_prior_context = self._residual_context(res_n, lossy_out["res_prior"])
 
         lmm_params = self.residual_compressor(res_prior_context)
         mu, log_sigma, coeffs, weights = torch.split(lmm_params, 5, dim=1)

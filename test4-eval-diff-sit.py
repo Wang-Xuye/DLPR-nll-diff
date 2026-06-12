@@ -383,6 +383,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--tau", type=int, default=1, help="near-lossless constraint (0, 1, 2, 3, ...)")
     parser.add_argument("--steps", type=int, default=20, help="DDIM sample steps used during evaluation")
+    parser.add_argument("--context-type", type=str, default="simple", choices=["simple"],
+                        help='Residual context module type. "simple" is masked 7x7 conv + 1x1 fusion.')
     args = parser.parse_args()
     tau = args.tau
 
@@ -393,7 +395,7 @@ if __name__ == "__main__":
     dset = Dataset(DATA_PATH)
     device = torch.device('cuda')
     nll_module_I = NearLosslessCompressor_I(192, 5).eval().to(device)
-    nll_module_P = NearLosslessCompressor_P(192, 5).eval().to(device)
+    nll_module_P = NearLosslessCompressor_P(192, 5, context_type=args.context_type).eval().to(device)
 
     # Load I-frame model
     ckp_I = torch.load(I_FRAME_CKP, map_location=device, weights_only=False)

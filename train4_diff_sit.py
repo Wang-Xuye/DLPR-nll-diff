@@ -268,12 +268,15 @@ def eval_epoch(model_I, model_P, criterion, eval_dataloader, epoch, save_dir, tb
     torch.save(model_P.state_dict(), f'{save_dir}/p-Ep{epoch + 1}-{img_bpp_p:.3f}-{img_bpp_p + res_bpp_p:.3f}-{img_bpp_p + res_bpp_cond_p:.3f}.pth')
 
 
-def train(train_dataloader, eval_dataloader, epochs, ckp_dir, log_dir, resume_ckp=None, stage="A", save_dir=SAVE_DIR_DEFAULT, start_epoch_override=None):
+def train(train_dataloader, eval_dataloader, epochs, ckp_dir, log_dir, resume_ckp=None,
+          stage="A", save_dir=SAVE_DIR_DEFAULT, start_epoch_override=None,
+          context_type="simple"):
     nll_module_I = NearLosslessCompressor_I(192, 5, "3P").cuda()
-    nll_module_P = NearLosslessCompressor_P(192, 5, "3P").cuda()
+    nll_module_P = NearLosslessCompressor_P(192, 5, "3P", context_type=context_type).cuda()
 
     stage = stage.upper()
     print(f"[stage] running STAGE={stage}")
+    print(f"[context] context_type={context_type}")
     if stage == "A":
         rd_criterion = RateDistortion_diff(lmbda=0.0, use_bpp=False, lmbda_diff_lmm=1.0)
     elif stage == "B":
@@ -427,6 +430,8 @@ if __name__ == "__main__":
                         help='Directory to save ckpt files for THIS run (Stage A/B/C should use different dirs)')
     parser.add_argument('--start-epoch', type=int, default=None,
                         help='Override start epoch (otherwise parsed from --resume filename p-Ep{N}-...pth)')
+    parser.add_argument('--context-type', type=str, default="simple", choices=["simple"],
+                        help='Residual context module type. "simple" is masked 7x7 conv + 1x1 fusion.')
     args = parser.parse_args()
 
     epochs = args.epochs
@@ -448,7 +453,7 @@ if __name__ == "__main__":
 
     train(train_dataloader, eval_dataloader, epochs, ckp_dir, log_dir,
           resume_ckp=args.resume, stage=args.stage, save_dir=args.save_dir,
-          start_epoch_override=args.start_epoch)
+          start_epoch_override=args.start_epoch, context_type=args.context_type)
 
 
 # ============================================================================
