@@ -179,14 +179,17 @@ def compress(model, input_img, COT, tau=0, patch_sz=64, mix_num=5, last_frame=No
 
         res_tmp = torch.zeros_like(x_hat)
 
-        ctx_total = model.mask_conv(res_q * norm_scale)
+        use_full_context_head = (
+            tau == 0
+            and getattr(model, "context_type", "simple") == "diffusion_fusion"
+        )
+        ctx_total = None if use_full_context_head else model.mask_conv(res_q * norm_scale)
 
         max_step = torch.max(COT)
         print(res.shape, max_step)
         for i in range(max_step):
 
             h_idx, w_idx = torch.nonzero(COT == i + 1, as_tuple=True)
-            ctx = ctx_total[:, :, h_idx, w_idx].unsqueeze(3)
             rp = res_prior[:, :, h_idx, w_idx].unsqueeze(3)
 
             res_crop = res_q[:, :, h_idx, w_idx]
@@ -194,12 +197,19 @@ def compress(model, input_img, COT, tau=0, patch_sz=64, mix_num=5, last_frame=No
             res_tmp_crop = res_tmp_crop.unsqueeze(3)
 
             if tau == 0:
-                lmm_params = lmm_params_from_context(model, rp, ctx)
+                if use_full_context_head:
+                    ctx_map = model.mask_conv(res_tmp * norm_scale)
+                    lmm_params_map = model._lmm_params_from_context(res_prior, ctx_map)
+                    lmm_params = lmm_params_map[:, :, h_idx, w_idx].unsqueeze(3)
+                else:
+                    ctx = ctx_total[:, :, h_idx, w_idx].unsqueeze(3)
+                    lmm_params = lmm_params_from_context(model, rp, ctx)
                 mu, log_sigma, coeffs, weights = torch.split(lmm_params, 5, dim=1)
                 coeffs = torch.tanh(coeffs)
             elif tau > 0:
                 if tau > 5:
                     tau = 5
+                ctx = ctx_total[:, :, h_idx, w_idx].unsqueeze(3)
                 rp_ctx = model.fusion_cond.run(torch.cat((rp, ctx), 1), tau - 1)
                 lmm_params = model.residual_compressor_cond.run(rp_ctx, tau - 1)
                 mu, log_sigma, coeffs, weights = torch.split(lmm_params, 5, dim=1)
@@ -291,24 +301,34 @@ def decompress(model, code_lossy, code_res, img_shape, res_range, COT, tau=0, mi
         res_prior = rec_lossy["res_prior"]
 
         res_tmp = torch.zeros_like(x_hat)
+        use_full_context_head = (
+            tau == 0
+            and getattr(model, "context_type", "simple") == "diffusion_fusion"
+        )
         max_step = torch.max(COT)
 
         j = 0
         for i in range(max_step):
 
             h_idx, w_idx = torch.nonzero(COT == i + 1, as_tuple=True)
-            ctx = model.mask_conv(res_tmp * norm_scale)[:, :, h_idx, w_idx].unsqueeze(3)
 
             rp = res_prior[:, :, h_idx, w_idx].unsqueeze(3)
             res_crop = res_tmp[:, :, h_idx, w_idx].unsqueeze(3)
 
             if tau == 0:
-                lmm_params = lmm_params_from_context(model, rp, ctx)
+                ctx_map = model.mask_conv(res_tmp * norm_scale)
+                if use_full_context_head:
+                    lmm_params_map = model._lmm_params_from_context(res_prior, ctx_map)
+                    lmm_params = lmm_params_map[:, :, h_idx, w_idx].unsqueeze(3)
+                else:
+                    ctx = ctx_map[:, :, h_idx, w_idx].unsqueeze(3)
+                    lmm_params = lmm_params_from_context(model, rp, ctx)
                 mu, log_sigma, coeffs, weights = torch.split(lmm_params, 5, dim=1)
                 coeffs = torch.tanh(coeffs)
             elif tau > 0:
                 if tau > 5:
                     tau = 5
+                ctx = model.mask_conv(res_tmp * norm_scale)[:, :, h_idx, w_idx].unsqueeze(3)
                 rp_ctx = model.fusion_cond.run(torch.cat((rp, ctx), 1), tau - 1)
                 lmm_params = model.residual_compressor_cond.run(rp_ctx, tau - 1)
                 mu, log_sigma, coeffs, weights = torch.split(lmm_params, 5, dim=1)
