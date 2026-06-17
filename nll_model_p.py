@@ -1292,6 +1292,44 @@ class SimpleContextLMMTeacher(nn.Module):
         return self.residual_compressor(fused)
 
 
+class PointwiseLMM_UNet(nn.Module):
+    """Pointwise diffusion denoiser for causal context fusion.
+
+    This uses only 1x1 convolutions, so each output pixel depends only on the
+    same pixel's lossy prior and already-causal residual context.
+    """
+
+    def __init__(self, params_ch=20, cond_ch=512, base_dim=64, depth=4):
+        super().__init__()
+        self.time_mlp = nn.Sequential(
+            nn.Linear(1, base_dim * 4),
+            nn.GELU(),
+            nn.Linear(base_dim * 4, base_dim),
+        )
+        self.conv_in = nn.Conv2d(params_ch + cond_ch, base_dim, 1)
+        self.blocks = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(base_dim, base_dim, 1),
+                nn.GELU(),
+                nn.Conv2d(base_dim, base_dim, 1),
+            )
+            for _ in range(depth)
+        ])
+        self.time_proj = nn.ModuleList([
+            nn.Linear(base_dim, base_dim)
+            for _ in range(depth)
+        ])
+        self.conv_out = nn.Conv2d(base_dim, params_ch, 1)
+
+    def forward(self, params_t, time, cond):
+        t = self.time_mlp(time)
+        x = self.conv_in(torch.cat([params_t, cond], dim=1))
+        for block, proj in zip(self.blocks, self.time_proj):
+            h = x + proj(t).unsqueeze(-1).unsqueeze(-1)
+            x = x + block(h)
+        return self.conv_out(x)
+
+
 class DiffusionContextLMMHead(DiffusionLMMHead):
     """Diffusion LMM head conditioned on lossy prior and causal residual context."""
 
@@ -1309,6 +1347,11 @@ class DiffusionContextLMMHead(DiffusionLMMHead):
             noise_seed=noise_seed,
             *args,
             **kwargs,
+        )
+        self.unet = PointwiseLMM_UNet(
+            params_ch=self.params_ch,
+            cond_ch=prior_ch + context_ch,
+            base_dim=base_dim,
         )
         self.teacher = SimpleContextLMMTeacher(prior_ch, context_ch, 256, num_mixtures)
         for p in self.teacher.parameters():
