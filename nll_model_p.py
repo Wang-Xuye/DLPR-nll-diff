@@ -423,9 +423,13 @@ class NearLosslessCompressor_I(nn.Module):
 
     def forward(self, input, tau):
         lossy_out = self.lossy_compressor(input)
-        noise = torch.empty_like(input).uniform_(-0.5, 0.5)
-
-        x_hat = torch.clamp(lossy_out["x_hat"] + noise, min = 0., max = nii_max_f)
+        if self.training:
+            noise = torch.empty_like(input).uniform_(-0.5, 0.5)
+            x_hat = torch.clamp(lossy_out["x_hat"] + noise, min = 0., max = nii_max_f)
+            rec_base = lossy_out["x_hat"]
+        else:
+            x_hat = torch.floor(lossy_out["x_hat"] + 0.5).clamp_(min=0, max=nii_max_f)
+            rec_base = x_hat
         
         res = input - x_hat
         res_n = res/nii_max_f*2
@@ -459,11 +463,11 @@ class NearLosslessCompressor_I(nn.Module):
         log_res_likelihoods_cond = lmm_model_cond(res_n.detach())
 
         return {
-            "x_hat": lossy_out["x_hat"],
+            "x_hat": x_hat,
             "res_likelihoods": log_res_likelihoods,
             "res_likelihoods_cond": log_res_likelihoods_cond,
             "img_likelihoods": lossy_out["likelihoods"],
-            "rec_img":torch.clamp( ( lossy_out["x_hat"]+ res_q), min = 0., max = nii_max_f),
+            "rec_img":torch.clamp( ( rec_base + res_q), min = 0., max = nii_max_f),
             **({"diffusion_loss": lossy_out["diffusion_loss"]} if "diffusion_loss" in lossy_out else {})
         }
 
@@ -541,9 +545,13 @@ class NearLosslessCompressor_P(nn.Module):
         lossy_out["res_prior"]=patchify_to_batch(lossy_out["res_prior"],64)
 
         input = patchify_to_batch(input,64)
-        noise = torch.empty_like(input).uniform_(-0.5, 0.5)
-
-        x_hat = torch.clamp(lossy_out["x_hat"] + noise, min = 0., max = nii_max_f)
+        if self.training:
+            noise = torch.empty_like(input).uniform_(-0.5, 0.5)
+            x_hat = torch.clamp(lossy_out["x_hat"] + noise, min = 0., max = nii_max_f)
+            rec_base = lossy_out["x_hat"]
+        else:
+            x_hat = torch.floor(lossy_out["x_hat"] + 0.5).clamp_(min=0, max=nii_max_f)
+            rec_base = x_hat
         
         res = input - x_hat
         res_n = res/nii_max_f*2
@@ -574,11 +582,11 @@ class NearLosslessCompressor_P(nn.Module):
         log_res_likelihoods_cond = lmm_model_cond(res_n.detach())
 
         return {
-            "x_hat": lossy_out["x_hat"],
+            "x_hat": x_hat,
             "res_likelihoods": log_res_likelihoods,
             "res_likelihoods_cond": log_res_likelihoods_cond,
             "img_likelihoods": lossy_out["likelihoods"],
-            "rec_img":torch.clamp( ( lossy_out["x_hat"]+ res_q), min = 0., max = nii_max_f),
+            "rec_img":torch.clamp( ( rec_base + res_q), min = 0., max = nii_max_f),
             **({"diffusion_loss": lossy_out["diffusion_loss"]} if "diffusion_loss" in lossy_out else {}),
             **({"diff_lmm_loss": self.residual_compressor.last_diff_loss}
                if getattr(self.residual_compressor, "last_diff_loss", None) is not None else {})
