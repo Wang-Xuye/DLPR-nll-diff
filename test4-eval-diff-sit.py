@@ -557,6 +557,9 @@ if __name__ == "__main__":
 
     with open(log_file, 'a') as f:
         f.write("\n===== Summary =====\n")
+        f.write("P-frame model: {}\n".format(args.p_frame_ckp))
+        f.write("I-frame model: {}\n".format(args.i_frame_ckp))
+        f.write("Context type: {}\n".format(args.context_type))
         f.write("I-frames: count={}, bpp={:.4f}\n".format(i_count, (i_zp + i_res_bit + i_lossy_bit) / i_pn if i_pn > 0 else 0))
         f.write("P-frames: count={}, bpp={:.4f}\n".format(p_count, (p_zp + p_res_bit + p_lossy_bit) / p_pn if p_pn > 0 else 0))
         f.write("Total: bpp={:.4f}, max_error={:.0f}\n".format(total_bits / total_pn if total_pn > 0 else 0, m_max_diff))
