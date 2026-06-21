@@ -404,6 +404,18 @@ def convert_old_keys(state_dict):
     return new_state_dict
 
 
+def next_available_path(path):
+    if not os.path.exists(path):
+        return path
+    stem, ext = os.path.splitext(path)
+    idx = 1
+    while True:
+        candidate = f"{stem}({idx}){ext}"
+        if not os.path.exists(candidate):
+            return candidate
+        idx += 1
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--tau", type=int, default=1, help="near-lossless constraint (0, 1, 2, 3, ...)")
@@ -453,7 +465,8 @@ if __name__ == "__main__":
     p_lossy_bit = 0
     m_max_diff = 0
     COT = coding_order_table7x7()
-    log_file = '{}-{}.txt'.format(args.log_prefix, tau)
+    log_file = next_available_path('{}-{}.txt'.format(args.log_prefix, tau))
+    print("Results will be saved to {}".format(log_file))
 
     for filez in dset:
         data = filez
