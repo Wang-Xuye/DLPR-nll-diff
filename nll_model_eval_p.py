@@ -586,14 +586,16 @@ class NearLosslessCompressor_I(nn.Module):
 class NearLosslessCompressor_P(nn.Module):
     def __init__(self, num_ch, cond_num, mask_type="3P", context_type="simple", *args, **kwargs):
         super().__init__(*args, **kwargs)
-        if context_type not in ("simple", "diffusion_fusion"):
+        if context_type not in ("legacy", "simple", "diffusion_fusion"):
             raise ValueError(f"Unsupported context_type={context_type!r}.")
         self.context_type = context_type
         # self.lossy_compressor = LossyCompressor_P(num_ch)
         self.lossy_compressor = LossyCompressor_P_diff_sit(num_ch, embed_dim=32)
         self.mask_conv = maskedconv7x7_parallel(1, 256, mask_type)
         self.fusion = conv1x1(256 * 2, 256)
-        if context_type == "simple":
+        if context_type == "legacy":
+            self.residual_compressor = ResidualCompressor(256, 5)
+        elif context_type == "simple":
             self.residual_compressor = DiffusionLMMHead(cond_ch=256, num_mixtures=5)
         else:
             self.residual_compressor = DiffusionContextLMMHead(
@@ -606,13 +608,13 @@ class NearLosslessCompressor_P(nn.Module):
         self.cond_num = cond_num
 
     def _residual_context(self, res_norm, res_prior):
-        if self.context_type == "simple":
+        if self.context_type in ("legacy", "simple"):
             context = self.mask_conv(res_norm)
             return self.fusion(torch.cat((res_prior, context), 1))
         raise RuntimeError(f"Unsupported context_type={self.context_type!r}")
 
     def _lmm_params_from_context(self, res_prior, residual_context):
-        if self.context_type == "simple":
+        if self.context_type in ("legacy", "simple"):
             res_prior_context = self.fusion(torch.cat((res_prior, residual_context), 1))
             return self.residual_compressor(res_prior_context)
         if self.context_type == "diffusion_fusion":

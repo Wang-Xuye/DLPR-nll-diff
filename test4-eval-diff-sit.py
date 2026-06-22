@@ -421,7 +421,7 @@ if __name__ == "__main__":
     parser.add_argument("--tau", type=int, default=1, help="near-lossless constraint (0, 1, 2, 3, ...)")
     parser.add_argument("--steps", type=int, default=20, help="DDIM sample steps used during evaluation")
     parser.add_argument("--context-type", type=str, default="simple",
-                        choices=["simple", "diffusion_fusion"],
+                        choices=["legacy", "simple", "diffusion_fusion"],
                         help="Residual context module type.")
     parser.add_argument("--data-path", type=str, default=DATA_PATH)
     parser.add_argument("--i-frame-ckp", type=str, default=I_FRAME_CKP)
