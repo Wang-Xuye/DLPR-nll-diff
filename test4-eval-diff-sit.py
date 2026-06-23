@@ -431,6 +431,8 @@ if __name__ == "__main__":
     parser.add_argument("--i-frame-ckp", type=str, default=I_FRAME_CKP)
     parser.add_argument("--p-frame-ckp", type=str, default=P_FRAME_CKP)
     parser.add_argument("--log-prefix", type=str, default=LOG_FILE_PREFIX)
+    parser.add_argument("--log-file", type=str, default=None,
+                        help="Exact log file path. If omitted, --log-prefix and tau are used.")
     args = parser.parse_args()
     tau = args.tau
 
@@ -471,7 +473,10 @@ if __name__ == "__main__":
     p_res_est_bit = 0.0
     m_max_diff = 0
     COT = coding_order_table7x7()
-    log_file = next_available_path('{}-{}.txt'.format(args.log_prefix, tau))
+    if args.log_file is None:
+        log_file = next_available_path('{}-{}.txt'.format(args.log_prefix, tau))
+    else:
+        log_file = next_available_path(args.log_file)
     print("Results will be saved to {}".format(log_file))
 
     for filez in dset:
