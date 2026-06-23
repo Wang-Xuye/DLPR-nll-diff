@@ -128,6 +128,7 @@ def compress(model, input_img, COT, tau=0, patch_sz=64, mix_num=5, last_frame=No
     norm_scale = 1 / nii_max_f * 2
     half = (0.5 + tau) * norm_scale
     code_res = []
+    est_res_bits = 0.0
     img_shape = input_img.shape[:2]
     bin_sz = 2 * tau + 1
     samples_end = (nii_max // bin_sz) * bin_sz
@@ -243,7 +244,10 @@ def compress(model, input_img, COT, tau=0, patch_sz=64, mix_num=5, last_frame=No
                 cdf = F.pad(cdf, (1, 0))
 
                 symbol = torch.div(res_crop[:, c, :].short() - res_q_min, bin_sz, rounding_mode='floor')
-                res_stream = torchac.encode_float_cdf(cdf.cpu(), symbol.cpu(), needs_normalization=False, check_input_bounds=False)
+                symbol_long = symbol.long()
+                symbol_prob = pmf.gather(2, symbol_long.unsqueeze(2)).squeeze(2).clamp_min(1e-12)
+                est_res_bits += float((-torch.log2(symbol_prob)).sum().item())
+                res_stream = torchac.encode_float_cdf(cdf.cpu(), symbol.cpu(), needs_normalization=True, check_input_bounds=False)
                 code_res.append(res_stream)
                 res_tmp_crop[:, c, :, 0] = symbol.float() * bin_sz + res_q_min
 
@@ -254,7 +258,7 @@ def compress(model, input_img, COT, tau=0, patch_sz=64, mix_num=5, last_frame=No
     encrestime += time_end_res - time_end_ls
     print("total runtime:{:.2f}, lossy runtime:{:.2f}, res runtime:{:.2f}".format(time_end_res - time_start, time_end_ls - time_start, time_end_res - time_end_ls))
 
-    return code_lossy, code_res, img_shape, (res_q_min, res_q_max), psnr_rrr
+    return code_lossy, code_res, img_shape, (res_q_min, res_q_max), psnr_rrr, est_res_bits
 
 
 def lmm_params_from_context(model, res_prior, residual_context):
@@ -361,7 +365,7 @@ def decompress(model, code_lossy, code_res, img_shape, res_range, COT, tau=0, mi
                 cdf = torch.cumsum(pmf, dim=2).clamp_(0., 1.)
                 cdf = F.pad(cdf, (1, 0))
 
-                symbol_out = torchac.decode_float_cdf(cdf.cpu(), code_res[j], needs_normalization=False)
+                symbol_out = torchac.decode_float_cdf(cdf.cpu(), code_res[j], needs_normalization=True)
                 res_crop[:, c, :, 0] = symbol_out.float() * bin_sz + res_q_min
                 j += 1
 
@@ -463,6 +467,8 @@ if __name__ == "__main__":
     i_lossy_bit = 0
     p_res_bit = 0
     p_lossy_bit = 0
+    i_res_est_bit = 0.0
+    p_res_est_bit = 0.0
     m_max_diff = 0
     COT = coding_order_table7x7()
     log_file = next_available_path('{}-{}.txt'.format(args.log_prefix, tau))
@@ -496,7 +502,7 @@ if __name__ == "__main__":
 
                 if i == start:
                     # I-frame
-                    code_lossy, code_res, img_shape, res_range, psnr_rrr = compress(nll_module_I, frame, COT, tau, 64, 5, None)
+                    code_lossy, code_res, img_shape, res_range, psnr_rrr, est_res_bits = compress(nll_module_I, frame, COT, tau, 64, 5, None)
                     img_ls_sz = sum([len(code_lossy['img_strings'][0][j]) + len(code_lossy['img_strings'][1][j]) for j in range(len(code_lossy['img_strings'][0]))])
                     res_sz = sum([len(code_res[j]) for j in range(len(code_res))])
                     nll_sz = img_ls_sz + res_sz + 6 * 4
@@ -504,6 +510,7 @@ if __name__ == "__main__":
                     rec = decompress(nll_module_I, code_lossy, code_res, img_shape, res_range, COT, tau, 5, 64, None)
 
                     i_res_bit += res_sz * 8
+                    i_res_est_bit += est_res_bits
                     i_lossy_bit += img_ls_sz * 8
                     i_zp += 6 * 4 * 8
                     i_pn += np.prod(frame.shape)
@@ -515,16 +522,16 @@ if __name__ == "__main__":
                     if m_max_diff < max_diff:
                         m_max_diff = max_diff
 
-                    print("I: bpsp:{:.4f}, img_bpsp:{:.4f}, res_bpsp:{:.4f}, psnr:{:.2f}".format(
+                    print("I: bpsp:{:.4f}, img_bpsp:{:.4f}, res_bpsp:{:.4f}, res_est_bpsp:{:.4f}, psnr:{:.2f}".format(
                         nll_sz * 8 / np.prod(frame.shape), img_ls_sz * 8 / np.prod(frame.shape),
-                        res_sz * 8 / np.prod(frame.shape), psnr_rrr))
+                        res_sz * 8 / np.prod(frame.shape), est_res_bits / np.prod(frame.shape), psnr_rrr))
                     with open(log_file, 'a') as f:
-                        f.write("I: bpsp:{:.4f}, img_bpsp:{:.4f}, res_bpsp:{:.4f}, psnr:{:.2f}\n".format(
+                        f.write("I: bpsp:{:.4f}, img_bpsp:{:.4f}, res_bpsp:{:.4f}, res_est_bpsp:{:.4f}, psnr:{:.2f}\n".format(
                             nll_sz * 8 / np.prod(frame.shape), img_ls_sz * 8 / np.prod(frame.shape),
-                            res_sz * 8 / np.prod(frame.shape), psnr_rrr))
+                            res_sz * 8 / np.prod(frame.shape), est_res_bits / np.prod(frame.shape), psnr_rrr))
                 else:
                     # P-frame
-                    code_lossy, code_res, img_shape, res_range, psnr_rrr = compress(nll_module_P, frame, COT, tau, 64, 5, last_frame)
+                    code_lossy, code_res, img_shape, res_range, psnr_rrr, est_res_bits = compress(nll_module_P, frame, COT, tau, 64, 5, last_frame)
                     img_ls_sz = sum([len(code_lossy['img_strings'][0][j]) + len(code_lossy['img_strings'][1][j]) for j in range(len(code_lossy['img_strings'][0]))])
                     res_sz = sum([len(code_res[j]) for j in range(len(code_res))])
                     nll_sz = img_ls_sz + res_sz + 6 * 4
@@ -532,6 +539,7 @@ if __name__ == "__main__":
                     rec = decompress(nll_module_P, code_lossy, code_res, img_shape, res_range, COT, tau, 5, 64, last_frame)
 
                     p_res_bit += res_sz * 8
+                    p_res_est_bit += est_res_bits
                     p_lossy_bit += img_ls_sz * 8
                     p_zp += 6 * 4 * 8
                     p_pn += np.prod(frame.shape)
@@ -543,13 +551,13 @@ if __name__ == "__main__":
                     if m_max_diff < max_diff:
                         m_max_diff = max_diff
 
-                    print("P: bpsp:{:.4f}, img_bpsp:{:.4f}, res_bpsp:{:.4f}, psnr:{:.2f}".format(
+                    print("P: bpsp:{:.4f}, img_bpsp:{:.4f}, res_bpsp:{:.4f}, res_est_bpsp:{:.4f}, psnr:{:.2f}".format(
                         nll_sz * 8 / np.prod(frame.shape), img_ls_sz * 8 / np.prod(frame.shape),
-                        res_sz * 8 / np.prod(frame.shape), psnr_rrr))
+                        res_sz * 8 / np.prod(frame.shape), est_res_bits / np.prod(frame.shape), psnr_rrr))
                     with open(log_file, 'a') as f:
-                        f.write("P: bpsp:{:.4f}, img_bpsp:{:.4f}, res_bpsp:{:.4f}, psnr:{:.2f}\n".format(
+                        f.write("P: bpsp:{:.4f}, img_bpsp:{:.4f}, res_bpsp:{:.4f}, res_est_bpsp:{:.4f}, psnr:{:.2f}\n".format(
                             nll_sz * 8 / np.prod(frame.shape), img_ls_sz * 8 / np.prod(frame.shape),
-                            res_sz * 8 / np.prod(frame.shape), psnr_rrr))
+                            res_sz * 8 / np.prod(frame.shape), est_res_bits / np.prod(frame.shape), psnr_rrr))
 
     total_count = i_count + p_count
     total_pn = i_pn + p_pn
@@ -563,6 +571,8 @@ if __name__ == "__main__":
         f.write("I-frames: count={}, bpp={:.4f}\n".format(i_count, (i_zp + i_res_bit + i_lossy_bit) / i_pn if i_pn > 0 else 0))
         f.write("P-frames: count={}, bpp={:.4f}\n".format(p_count, (p_zp + p_res_bit + p_lossy_bit) / p_pn if p_pn > 0 else 0))
         f.write("Total: bpp={:.4f}, max_error={:.0f}\n".format(total_bits / total_pn if total_pn > 0 else 0, m_max_diff))
+        f.write("I residual estimated bpp: {:.4f}\n".format(i_res_est_bit / i_pn if i_pn > 0 else 0))
+        f.write("P residual estimated bpp: {:.4f}\n".format(p_res_est_bit / p_pn if p_pn > 0 else 0))
         if i_count > 0:
             f.write("I avg PSNR: {:.2f}\n".format(I_PSNR / i_count))
         if p_count > 0:
