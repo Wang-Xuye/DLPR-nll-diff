@@ -1,5 +1,20 @@
 import os
-os.environ['CUDA_VISIBLE_DEVICES'] = '3'
+import sys
+
+
+def read_cuda_visible_devices(default="3"):
+    for idx, arg in enumerate(sys.argv):
+        if arg in ("--gpu-id", "--cuda-visible-devices") and idx + 1 < len(sys.argv):
+            return sys.argv[idx + 1]
+        if arg.startswith("--gpu-id="):
+            return arg.split("=", 1)[1]
+        if arg.startswith("--cuda-visible-devices="):
+            return arg.split("=", 1)[1]
+    return os.environ.get("CUDA_VISIBLE_DEVICES", default)
+
+
+CUDA_VISIBLE_DEVICES = read_cuda_visible_devices()
+os.environ["CUDA_VISIBLE_DEVICES"] = CUDA_VISIBLE_DEVICES
 os.environ['TMPDIR'] = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'tmp')
 os.makedirs(os.environ['TMPDIR'], exist_ok=True)
 
@@ -433,6 +448,9 @@ if __name__ == "__main__":
     parser.add_argument('--context-type', type=str, default="simple",
                         choices=["simple", "diffusion_fusion"],
                         help='Residual context module type.')
+    parser.add_argument('--gpu-id', '--cuda-visible-devices', dest='gpu_id',
+                        type=str, default=CUDA_VISIBLE_DEVICES,
+                        help='CUDA_VISIBLE_DEVICES value, for example 0 or 0,1.')
     args = parser.parse_args()
 
     epochs = args.epochs
@@ -445,6 +463,7 @@ if __name__ == "__main__":
     log_dir = "logs4_diff"
 
     os.makedirs(log_dir, exist_ok=True)
+    print(f"[info] CUDA_VISIBLE_DEVICES={os.environ['CUDA_VISIBLE_DEVICES']}")
 
     train_dataset = Dataset_seq("../Mosmed/train-full")
     test_dataset = Dataset_test("../Mosmed/test-slice")

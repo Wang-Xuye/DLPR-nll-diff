@@ -1,5 +1,20 @@
 import os
-os.environ['CUDA_VISIBLE_DEVICES'] = '3'
+import sys
+
+
+def read_cuda_visible_devices(default="3"):
+    for idx, arg in enumerate(sys.argv):
+        if arg in ("--gpu-id", "--cuda-visible-devices") and idx + 1 < len(sys.argv):
+            return sys.argv[idx + 1]
+        if arg.startswith("--gpu-id="):
+            return arg.split("=", 1)[1]
+        if arg.startswith("--cuda-visible-devices="):
+            return arg.split("=", 1)[1]
+    return os.environ.get("CUDA_VISIBLE_DEVICES", default)
+
+
+CUDA_VISIBLE_DEVICES = read_cuda_visible_devices()
+os.environ["CUDA_VISIBLE_DEVICES"] = CUDA_VISIBLE_DEVICES
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -433,12 +448,16 @@ if __name__ == "__main__":
     parser.add_argument("--log-prefix", type=str, default=LOG_FILE_PREFIX)
     parser.add_argument("--log-file", type=str, default=None,
                         help="Exact log file path. If omitted, --log-prefix and tau are used.")
+    parser.add_argument("--gpu-id", "--cuda-visible-devices", dest="gpu_id",
+                        type=str, default=CUDA_VISIBLE_DEVICES,
+                        help="CUDA_VISIBLE_DEVICES value, for example 0 or 0,1.")
     args = parser.parse_args()
     tau = args.tau
 
     import nll_model_eval_p as _nme
     _nme.EVAL_DDIM_STEPS = args.steps
     print(f"[info] EVAL_DDIM_STEPS set to {args.steps}")
+    print(f"[info] CUDA_VISIBLE_DEVICES={os.environ['CUDA_VISIBLE_DEVICES']}")
 
     dset = Dataset(args.data_path)
     device = torch.device('cuda')

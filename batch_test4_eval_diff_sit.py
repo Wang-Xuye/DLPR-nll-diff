@@ -32,6 +32,9 @@ def main():
     parser.add_argument("--log-dir", type=str, default=".")
     parser.add_argument("--test-script", type=str, default="test4-eval-diff-sit.py")
     parser.add_argument("--python", type=str, default=sys.executable)
+    parser.add_argument("--gpu-id", "--cuda-visible-devices", dest="gpu_id",
+                        type=str, default=None,
+                        help="CUDA_VISIBLE_DEVICES value passed to the test script.")
     parser.add_argument("--dry-run", action="store_true",
                         help="Print commands without running them.")
     args = parser.parse_args()
@@ -57,6 +60,8 @@ def main():
                 "--p-frame-ckp", model,
                 "--log-file", log_file,
             ]
+            if args.gpu_id is not None:
+                cmd.extend(["--gpu-id", args.gpu_id])
 
             print("\n[batch] model={} tau={} log={}".format(model, tau, log_file))
             print("[batch] {}".format(" ".join(cmd)))
