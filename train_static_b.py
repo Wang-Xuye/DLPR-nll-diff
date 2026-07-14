@@ -69,6 +69,38 @@ def remove_module_prefix(state_dict, prefix="module."):
     }
 
 
+def extract_state_dict(checkpoint):
+    if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+        return checkpoint["model_state_dict"]
+    return checkpoint
+
+
+def convert_entropy_bottleneck_keys(state_dict):
+    new_state_dict = {}
+    for key, value in state_dict.items():
+        new_key = key
+        new_key = new_key.replace(
+            ".entropy_bottleneck._matrix",
+            ".entropy_bottleneck.matrices.",
+        )
+        new_key = new_key.replace(
+            ".entropy_bottleneck._bias",
+            ".entropy_bottleneck.biases.",
+        )
+        new_key = new_key.replace(
+            ".entropy_bottleneck._factor",
+            ".entropy_bottleneck.factors.",
+        )
+        new_state_dict[new_key] = value
+    return new_state_dict
+
+
+def normalize_checkpoint_keys(checkpoint):
+    state_dict = extract_state_dict(checkpoint)
+    state_dict = remove_module_prefix(state_dict, prefix="module.")
+    return convert_entropy_bottleneck_keys(state_dict)
+
+
 def configure_optimizers(model, lr, aux_lr):
     parameters = {
         n
@@ -291,13 +323,12 @@ def train(args):
     criterion = RateDistortion(lmbda=args.lmbda)
 
     ckp_i = torch.load(args.i_frame_ckp, map_location=device, weights_only=False)
-    model_i.load_state_dict(ckp_i["model_state_dict"])
+    model_i.load_state_dict(normalize_checkpoint_keys(ckp_i))
     model_i.lossy_compressor.update(force=True)
 
     if args.resume:
         ckp_p = torch.load(args.resume, map_location=device, weights_only=False)
-        ckp_p = remove_module_prefix(ckp_p, prefix="module.")
-        model_p.load_state_dict(ckp_p)
+        model_p.load_state_dict(normalize_checkpoint_keys(ckp_p))
     model_p.lossy_compressor.update(force=True)
 
     optimizer_p, aux_optimizer_p, optimizer_nll_p = configure_optimizers(
