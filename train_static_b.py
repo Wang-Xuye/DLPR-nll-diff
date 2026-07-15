@@ -140,6 +140,18 @@ def configure_optimizers(model, lr, aux_lr):
     return optimizer, aux_optimizer, optimizer_nll
 
 
+def tensor_is_finite(value):
+    return torch.isfinite(value.detach()).all().item()
+
+
+def optimizer_grads_finite(optimizer):
+    for group in optimizer.param_groups:
+        for param in group["params"]:
+            if param.grad is not None and not torch.isfinite(param.grad).all().item():
+                return False
+    return True
+
+
 class DatasetSeq:
     def __init__(self, root_dir, gop_size=9, random_crop=True):
         self.root_dir = root_dir
@@ -226,6 +238,21 @@ def train_one_epoch(
             )
 
             target = patchify_to_batch(frames[:, idx0], 64)
+            out_criterion = criterion(out, target)
+            if (
+                not tensor_is_finite(out_criterion["loss"])
+                or not tensor_is_finite(out_criterion["res_bpp_cond"])
+                or not tensor_is_finite(out["rec_img"])
+            ):
+                print(
+                    f"[warn] skip non-finite training step: "
+                    f"tau={tau}, step={step}, target={idx0}"
+                )
+                optimizer_p.zero_grad()
+                aux_optimizer_p.zero_grad()
+                optimizer_nll_p.zero_grad()
+                break
+
             rec = unpatchify_from_batch(
                 out["rec_img"].detach(),
                 frames[:, idx0].shape[0],
@@ -234,20 +261,51 @@ def train_one_epoch(
             )
             ref_buffer[:, idx0:idx0 + 1] = rec
 
-            out_criterion = criterion(out, target)
             out_criterion["loss"].backward()
             if clip_max_norm:
                 nn.utils.clip_grad_norm_(model_p.parameters_wo_cond(), clip_max_norm)
+            if not optimizer_grads_finite(optimizer_p):
+                print(
+                    f"[warn] skip non-finite main gradients: "
+                    f"tau={tau}, step={step}, target={idx0}"
+                )
+                optimizer_p.zero_grad()
+                aux_optimizer_p.zero_grad()
+                optimizer_nll_p.zero_grad()
+                break
             optimizer_p.step()
 
             out_criterion["res_bpp_cond"].backward()
             if clip_max_norm:
                 nn.utils.clip_grad_norm_(model_p.parameters_w_cond(), clip_max_norm)
+            if not optimizer_grads_finite(optimizer_nll_p):
+                print(
+                    f"[warn] skip non-finite residual gradients: "
+                    f"tau={tau}, step={step}, target={idx0}"
+                )
+                optimizer_p.zero_grad()
+                aux_optimizer_p.zero_grad()
+                optimizer_nll_p.zero_grad()
+                break
             optimizer_nll_p.step()
 
             aux_loss = model_p.lossy_compressor.aux_loss()
-            aux_loss.backward()
-            aux_optimizer_p.step()
+            if tensor_is_finite(aux_loss):
+                aux_loss.backward()
+                if optimizer_grads_finite(aux_optimizer_p):
+                    aux_optimizer_p.step()
+                else:
+                    print(
+                        f"[warn] skip non-finite aux gradients: "
+                        f"tau={tau}, step={step}, target={idx0}"
+                    )
+                    aux_optimizer_p.zero_grad()
+            else:
+                print(
+                    f"[warn] skip non-finite aux loss: "
+                    f"tau={tau}, step={step}, target={idx0}"
+                )
+                aux_optimizer_p.zero_grad()
 
 
 def eval_epoch(model_i, model_p, criterion, eval_dataloader, epoch, save_dir):
@@ -279,6 +337,19 @@ def eval_epoch(model_i, model_p, criterion, eval_dataloader, epoch, save_dir):
                     tau,
                 )
                 target = patchify_to_batch(frames[:, idx0], 64)
+                out_criterion = criterion(out, target)
+                if (
+                    not tensor_is_finite(out_criterion["img_bpp"])
+                    or not tensor_is_finite(out_criterion["res_bpp"])
+                    or not tensor_is_finite(out_criterion["res_bpp_cond"])
+                    or not tensor_is_finite(out["rec_img"])
+                ):
+                    print(
+                        f"[warn] skip non-finite eval step: "
+                        f"tau={tau}, step={step}, target={idx0}"
+                    )
+                    break
+
                 rec = unpatchify_from_batch(
                     out["rec_img"].detach(),
                     frames[:, idx0].shape[0],
@@ -287,11 +358,14 @@ def eval_epoch(model_i, model_p, criterion, eval_dataloader, epoch, save_dir):
                 )
                 ref_buffer[:, idx0:idx0 + 1] = rec
 
-                out_criterion = criterion(out, target)
                 img_bpp_p += float(out_criterion["img_bpp"].detach())
                 res_bpp_p += float(out_criterion["res_bpp"].detach())
                 res_bpp_cond_p += float(out_criterion["res_bpp_cond"].detach())
                 frame_count += 1
+
+    if frame_count == 0:
+        print(f"[warn] epoch {epoch + 1}: no finite eval frames, checkpoint not saved.")
+        return
 
     img_bpp_p /= max(frame_count, 1)
     res_bpp_p /= max(frame_count, 1)
@@ -386,7 +460,7 @@ def train(args):
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--train-path", type=str, default="../Mosmed/train-full")
-    parser.add_argument("--eval-path", type=str, default="../Mosmed/test-slice")
+    parser.add_argument("--eval-path", type=str, default="../Mosmed/test-full")
     parser.add_argument("--i-frame-ckp", type=str, default="ckp_nll/0001/ckp.tar")
     parser.add_argument("--resume", type=str, default=None)
     parser.add_argument("--save-dir", type=str, default="log_static_b")
