@@ -480,6 +480,12 @@ class NearLosslessCompressor_I(nn.Module):
 
     def load_state_dict(self, state_dict):
         update_registered_buffers(
+            self.lossy_compressor.entropy_bottleneck,
+            "lossy_compressor.entropy_bottleneck",
+            ["_quantized_cdf", "_offset", "_cdf_length"],
+            state_dict,
+        )
+        update_registered_buffers(
             self.lossy_compressor.gaussian_conditional,
             "lossy_compressor.gaussian_conditional",
             ["_quantized_cdf", "_offset", "_cdf_length", "scale_table"],
@@ -572,6 +578,12 @@ class NearLosslessCompressor_P(nn.Module):
 
 
     def load_state_dict(self, state_dict):
+        update_registered_buffers(
+            self.lossy_compressor.entropy_bottleneck,
+            "lossy_compressor.entropy_bottleneck",
+            ["_quantized_cdf", "_offset", "_cdf_length"],
+            state_dict,
+        )
         update_registered_buffers(
             self.lossy_compressor.gaussian_conditional,
             "lossy_compressor.gaussian_conditional",
