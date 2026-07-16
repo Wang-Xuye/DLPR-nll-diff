@@ -1,6 +1,7 @@
 import argparse
 import os
 import random
+import re
 import sys
 
 
@@ -99,6 +100,15 @@ def normalize_checkpoint_keys(checkpoint):
     state_dict = extract_state_dict(checkpoint)
     state_dict = remove_module_prefix(state_dict, prefix="module.")
     return convert_entropy_bottleneck_keys(state_dict)
+
+
+def parse_resume_epoch(path):
+    if not path:
+        return 0
+    match = re.search(r"p-Ep(\d+)-", os.path.basename(path))
+    if match is None:
+        return 0
+    return int(match.group(1))
 
 
 def configure_optimizers(model, lr, aux_lr):
@@ -472,6 +482,13 @@ def train(args):
         model_p.load_state_dict(normalize_checkpoint_keys(ckp_p))
     model_p.lossy_compressor.update(force=True)
 
+    start_epoch = parse_resume_epoch(args.resume)
+    if args.start_epoch is not None:
+        start_epoch = args.start_epoch
+    if args.resume:
+        print(f"[info] resume={args.resume}")
+        print(f"[info] start_epoch={start_epoch}")
+
     optimizer_p, aux_optimizer_p, optimizer_nll_p = configure_optimizers(
         model_p, lr=args.lr, aux_lr=args.aux_lr
     )
@@ -505,7 +522,11 @@ def train(args):
     print(f"[info] CUDA_VISIBLE_DEVICES={os.environ['CUDA_VISIBLE_DEVICES']}")
     print(f"[info] static ref_map={STATIC_REF_MAP_9}")
 
-    for epoch in range(args.epochs):
+    for _ in range(start_epoch):
+        scheduler_p.step()
+        scheduler_nll_p.step()
+
+    for epoch in range(start_epoch, args.epochs):
         train_one_epoch(
             model_i,
             model_p,
@@ -530,6 +551,8 @@ def parse_args():
     parser.add_argument("--eval-path", type=str, default="../Mosmed/test-full")
     parser.add_argument("--i-frame-ckp", type=str, default="ckp_nll/0001/ckp.tar")
     parser.add_argument("--resume", type=str, default=None)
+    parser.add_argument("--start-epoch", type=int, default=None,
+                        help="Override start epoch. Otherwise parsed from --resume p-Ep{N}-...pth.")
     parser.add_argument("--save-dir", type=str, default="log_static_b")
     parser.add_argument("--log-dir", type=str, default="logs_static_b")
     parser.add_argument("--epochs", type=int, default=10000)
