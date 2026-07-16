@@ -31,10 +31,10 @@ from tqdm import tqdm
 from nll_model_b import (
     NearLosslessCompressor_I,
     NearLosslessCompressor_P,
-    RateDistortion,
     patchify_to_batch,
     unpatchify_from_batch,
 )
+from global_nii_max import nii_max_f
 
 
 STATIC_REF_MAP_9 = [
@@ -152,6 +152,66 @@ def optimizer_grads_finite(optimizer):
     return True
 
 
+class StableRateDistortion(nn.Module):
+    def __init__(self, lmbda=0.01, likelihood_lower_bound=1e-9):
+        super().__init__()
+        self.mse = nn.MSELoss()
+        self.lmbda = lmbda
+        self.likelihood_lower_bound = likelihood_lower_bound
+
+    def safe_likelihood(self, likelihoods):
+        return torch.nan_to_num(
+            likelihoods,
+            nan=self.likelihood_lower_bound,
+            posinf=1.0,
+            neginf=self.likelihood_lower_bound,
+        ).clamp_min(self.likelihood_lower_bound)
+
+    def safe_log_likelihood(self, log_likelihoods):
+        min_log = math.log(self.likelihood_lower_bound)
+        return torch.nan_to_num(
+            log_likelihoods,
+            nan=min_log,
+            posinf=0.0,
+            neginf=min_log,
+        ).clamp(min=min_log, max=0.0)
+
+    def forward(self, output, target):
+        n, _, h, w = target.size()
+        num_pixels = n * h * w
+        out = {}
+
+        out["img_bpp"] = sum(
+            torch.log(self.safe_likelihood(likelihoods)).sum()
+            / (-math.log(2) * num_pixels)
+            for likelihoods in output["img_likelihoods"].values()
+        )
+        out["res_bpp"] = (
+            self.safe_log_likelihood(output["res_likelihoods"]).sum()
+            / (-math.log(2) * num_pixels)
+        )
+        out["res_bpp_cond"] = (
+            self.safe_log_likelihood(output["res_likelihoods_cond"]).sum()
+            / (-math.log(2) * num_pixels)
+        )
+
+        x_hat = torch.clamp(output["x_hat"], min=-0.5, max=nii_max_f + 0.5)
+        out["mse_loss"] = self.mse(x_hat, target)
+        out["loss"] = self.lmbda * out["mse_loss"] + out["img_bpp"] + out["res_bpp"]
+        return out
+
+
+def format_criterion_values(out_criterion):
+    fields = ("loss", "img_bpp", "res_bpp", "res_bpp_cond", "mse_loss")
+    values = []
+    for field in fields:
+        value = out_criterion.get(field)
+        if value is None:
+            continue
+        values.append(f"{field}={float(value.detach().cpu()):.6g}")
+    return ", ".join(values)
+
+
 class DatasetSeq:
     def __init__(self, root_dir, gop_size=9, random_crop=True):
         self.root_dir = root_dir
@@ -246,7 +306,9 @@ def train_one_epoch(
             ):
                 print(
                     f"[warn] skip non-finite training step: "
-                    f"tau={tau}, step={step}, target={idx0}"
+                    f"tau={tau}, step={step}, target={idx0}, "
+                    f"{format_criterion_values(out_criterion)}, "
+                    f"rec_finite={tensor_is_finite(out['rec_img'])}"
                 )
                 optimizer_p.zero_grad()
                 aux_optimizer_p.zero_grad()
@@ -346,7 +408,9 @@ def eval_epoch(model_i, model_p, criterion, eval_dataloader, epoch, save_dir):
                 ):
                     print(
                         f"[warn] skip non-finite eval step: "
-                        f"tau={tau}, step={step}, target={idx0}"
+                        f"tau={tau}, step={step}, target={idx0}, "
+                        f"{format_criterion_values(out_criterion)}, "
+                        f"rec_finite={tensor_is_finite(out['rec_img'])}"
                     )
                     break
 
@@ -394,7 +458,10 @@ def train(args):
 
     model_i = NearLosslessCompressor_I(192, 5, "3P").to(device)
     model_p = NearLosslessCompressor_P(192, 5, "3P").to(device)
-    criterion = RateDistortion(lmbda=args.lmbda)
+    criterion = StableRateDistortion(
+        lmbda=args.lmbda,
+        likelihood_lower_bound=args.likelihood_lower_bound,
+    )
 
     ckp_i = torch.load(args.i_frame_ckp, map_location=device, weights_only=False)
     model_i.load_state_dict(normalize_checkpoint_keys(ckp_i))
@@ -470,6 +537,7 @@ def parse_args():
     parser.add_argument("--num-workers", type=int, default=8)
     parser.add_argument("--gop-size", type=int, default=9)
     parser.add_argument("--lmbda", type=float, default=0.03)
+    parser.add_argument("--likelihood-lower-bound", type=float, default=1e-9)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--aux-lr", type=float, default=1e-3)
     parser.add_argument("--gamma", type=float, default=0.9)
