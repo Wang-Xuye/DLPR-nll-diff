@@ -344,7 +344,7 @@ class LossyCompressor_I(CompressionModel):
         y = self.encoder(input / nii_max_f)
         z = self.hyperencoder(y)
         z_strings = self.entropy_bottleneck.compress(z)
-        z_hat = self.entropy_bottleneck.decompress(z_strings, z.size()[-2:], z.size()[:2])
+        z_hat = self.entropy_bottleneck.decompress(z_strings, z.size()[-2:])
 
         mu_hat, sigma_hat = self.hyperdecoder(z_hat)
         n, c, h, w = mu_hat.shape
@@ -358,7 +358,7 @@ class LossyCompressor_I(CompressionModel):
 
     def decompress(self, strings, shape):
         assert isinstance(strings, list) and len(strings) == 2
-        z_hat = self.entropy_bottleneck.decompress(strings[1], shape[2:], shape[:2])
+        z_hat = self.entropy_bottleneck.decompress(strings[1], shape[2:])
 
         mu_hat, sigma_hat = self.hyperdecoder(z_hat)
         n, c, h, w = mu_hat.shape
@@ -447,7 +447,7 @@ class LossyCompressor_P(CompressionModel):
         y = self.encoder(input / nii_max_f, pre / nii_max_f, nxt / nii_max_f)
         z = self.hyperencoder(y)
         z_strings = self.entropy_bottleneck.compress(z)
-        z_hat = self.entropy_bottleneck.decompress(z_strings, z.size()[-2:], z.size()[:2])
+        z_hat = self.entropy_bottleneck.decompress(z_strings, z.size()[-2:])
 
         mu_hat, sigma_hat = self.hyperdecoder(z_hat)
         n, c, h, w = mu_hat.shape
@@ -461,7 +461,7 @@ class LossyCompressor_P(CompressionModel):
 
     def decompress(self, strings, shape, pre, nxt):
         assert isinstance(strings, list) and len(strings) == 2
-        z_hat = self.entropy_bottleneck.decompress(strings[1], shape[2:], shape[:2])
+        z_hat = self.entropy_bottleneck.decompress(strings[1], shape[2:])
 
         mu_hat, sigma_hat = self.hyperdecoder(z_hat)
         n, c, h, w = mu_hat.shape
