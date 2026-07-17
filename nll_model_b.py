@@ -340,6 +340,39 @@ class LossyCompressor_I(CompressionModel):
             "likelihoods": {"y": y_likelihoods, "z": z_likelihoods}
         }
 
+    def compress(self, input):
+        y = self.encoder(input / nii_max_f)
+        z = self.hyperencoder(y)
+        z_strings = self.entropy_bottleneck.compress(z)
+        z_hat = self.entropy_bottleneck.decompress(z_strings, z.size()[-2:], z.size()[:2])
+
+        mu_hat, sigma_hat = self.hyperdecoder(z_hat)
+        n, c, h, w = mu_hat.shape
+        indexes = self.gaussian_conditional.build_indexes(sigma_hat.reshape(1, n * c, h, w))
+        y_strings = self.gaussian_conditional.compress(
+            y.reshape(1, n * c, h, w),
+            indexes,
+            means=mu_hat.reshape(1, n * c, h, w),
+        )
+        return {"img_strings": [y_strings, z_strings], "shape": z.size()[-4:]}
+
+    def decompress(self, strings, shape):
+        assert isinstance(strings, list) and len(strings) == 2
+        z_hat = self.entropy_bottleneck.decompress(strings[1], shape[2:], shape[:2])
+
+        mu_hat, sigma_hat = self.hyperdecoder(z_hat)
+        n, c, h, w = mu_hat.shape
+        indexes = self.gaussian_conditional.build_indexes(sigma_hat.reshape(1, n * c, h, w))
+        y_hat = self.gaussian_conditional.decompress(
+            strings[0],
+            indexes,
+            means=mu_hat.reshape(1, n * c, h, w),
+        )
+        y_hat = y_hat.reshape(n, c, h, w)
+        x_hat, res_prior = self.decoder(y_hat)
+        x_hat = torch.floor(x_hat * nii_max_f + 0.5).clamp_(min=0, max=nii_max)
+        return {"x_hat": x_hat, "res_prior": res_prior}
+
     def update(self, scale_table=None, force=False):
         if scale_table is None:
             scale_table = get_scale_table()
@@ -409,6 +442,39 @@ class LossyCompressor_P(CompressionModel):
             "res_prior":res_prior,
             "likelihoods": {"y": y_likelihoods, "z": z_likelihoods}
         }
+
+    def compress(self, input, pre, nxt):
+        y = self.encoder(input / nii_max_f, pre / nii_max_f, nxt / nii_max_f)
+        z = self.hyperencoder(y)
+        z_strings = self.entropy_bottleneck.compress(z)
+        z_hat = self.entropy_bottleneck.decompress(z_strings, z.size()[-2:], z.size()[:2])
+
+        mu_hat, sigma_hat = self.hyperdecoder(z_hat)
+        n, c, h, w = mu_hat.shape
+        indexes = self.gaussian_conditional.build_indexes(sigma_hat.reshape(1, n * c, h, w))
+        y_strings = self.gaussian_conditional.compress(
+            y.reshape(1, n * c, h, w),
+            indexes,
+            means=mu_hat.reshape(1, n * c, h, w),
+        )
+        return {"img_strings": [y_strings, z_strings], "shape": z.size()[-4:]}
+
+    def decompress(self, strings, shape, pre, nxt):
+        assert isinstance(strings, list) and len(strings) == 2
+        z_hat = self.entropy_bottleneck.decompress(strings[1], shape[2:], shape[:2])
+
+        mu_hat, sigma_hat = self.hyperdecoder(z_hat)
+        n, c, h, w = mu_hat.shape
+        indexes = self.gaussian_conditional.build_indexes(sigma_hat.reshape(1, n * c, h, w))
+        y_hat = self.gaussian_conditional.decompress(
+            strings[0],
+            indexes,
+            means=mu_hat.reshape(1, n * c, h, w),
+        )
+        y_hat = y_hat.reshape(n, c, h, w)
+        x_hat, res_prior = self.decoder(y_hat, pre / nii_max_f, nxt / nii_max_f)
+        x_hat = torch.floor(x_hat * nii_max_f + 0.5).clamp_(min=0, max=nii_max)
+        return {"x_hat": x_hat, "res_prior": res_prior}
 
     def update(self, scale_table=None, force=False):
         if scale_table is None:
