@@ -192,6 +192,19 @@ def lossy_size_bytes(code_lossy):
     )
 
 
+def conditional_lmm_params(model, rp, ctx, tau):
+    tau_cond = min(tau, model.cond_num)
+    tau_list = torch.full(
+        (rp.shape[0],),
+        tau_cond - 1,
+        dtype=torch.long,
+        device=rp.device,
+    )
+    cond = F.one_hot(tau_list, num_classes=model.cond_num).float()
+    rp_ctx = model.fusion_cond(torch.cat((rp, ctx), 1), cond)
+    return model.residual_compressor_cond(rp_ctx, cond)
+
+
 def compress(model, input_img, cot, tau=0, patch_sz=64, ref_l=None, ref_r=None):
     global enc_lossy_time, enc_res_time
     norm_scale = 1 / nii_max_f * 2
@@ -254,9 +267,7 @@ def compress(model, input_img, cot, tau=0, patch_sz=64, ref_l=None, ref_r=None):
                 rp_ctx = model.fusion(torch.cat((rp, ctx), 1))
                 lmm_params = model.residual_compressor(rp_ctx)
             else:
-                tau_cond = min(tau, 5)
-                rp_ctx = model.fusion_cond.run(torch.cat((rp, ctx), 1), tau_cond - 1)
-                lmm_params = model.residual_compressor_cond.run(rp_ctx, tau_cond - 1)
+                lmm_params = conditional_lmm_params(model, rp, ctx, tau)
             mu, log_sigma, coeffs, weights = torch.split(lmm_params, 5, dim=1)
 
             mu_c = mu.permute(0, 2, 1, 3)
@@ -342,9 +353,7 @@ def decompress(model, code_lossy, code_res, img_shape, res_range, cot, tau=0, pa
                 rp_ctx = model.fusion(torch.cat((rp, ctx), 1))
                 lmm_params = model.residual_compressor(rp_ctx)
             else:
-                tau_cond = min(tau, 5)
-                rp_ctx = model.fusion_cond.run(torch.cat((rp, ctx), 1), tau_cond - 1)
-                lmm_params = model.residual_compressor_cond.run(rp_ctx, tau_cond - 1)
+                lmm_params = conditional_lmm_params(model, rp, ctx, tau)
             mu, log_sigma, coeffs, weights = torch.split(lmm_params, 5, dim=1)
 
             mu_c = mu.permute(0, 2, 1, 3)
