@@ -323,3 +323,65 @@ logs_dynamic_b/
 - 与原单参考 P 帧模型对比。
 - 与 `DLPR-Mosmed-nll-b` 中动态参考帧实现对比。
 - 在静态版本稳定后，进一步迁移动态参考帧策略。
+
+## 11. 静态 B 帧接入 Diff-SIT 有损压缩
+
+在当前基础上新增了一套独立的 diffusion 静态 B 帧实验入口，用于验证“扩散模型替换有损压缩部分”是否能提升静态双参考 B 帧效果。
+
+新增文件：
+
+```text
+nll_model_b_diff.py
+train_static_b_diff.py
+test_static_b_diff.py
+```
+
+设计原则：
+
+- 不修改原来的 `nll_model_b.py`、`train_static_b.py`、`test_static_b.py`，保留无扩散静态 B 帧作为 baseline。
+- 只替换 P/B 帧有损压缩器，残差概率模型仍使用原来的简单上下文和条件残差头。
+- 训练和测试继续使用相同的固定 9 帧静态参考表，避免引入动态参考帧变量。
+
+模型结构：
+
+- `LossyCompressor_B_diff_sit` 参考原 P 帧 `LossyCompressor_P_diff_sit` 实现。
+- 输入从单参考 `current, pre` 改为双参考 `current, ref_l, ref_r`。
+- `Encoder_B_CDC` 分别编码当前帧、左参考帧、右参考帧，然后融合三个特征。
+- diffusion U-Net 的参考条件使用 `DualRefEncoder`，将左右参考帧拼接为 2 通道后编码为多尺度条件特征。
+- diffusion 输出当前帧的有损重建，同时 `ResPriorHead` 输出残差先验 `res_prior`。
+- 残差编码仍沿用原来的 `mask_conv + fusion/fusion_cond + residual_compressor/residual_compressor_cond`。
+
+训练命令：
+
+```bash
+cd /data_a/wxy/linc/DLPR-Mosmed-nll
+
+python train_static_b_diff.py \
+  --train-path ../Mosmed/train-full \
+  --eval-path ../Mosmed/test-full \
+  --i-frame-ckp ckp_nll/0001/ckp.tar \
+  --save-dir log_static_b_diff \
+  --log-dir logs_static_b_diff \
+  --epochs 10000 \
+  --batch-size 1 \
+  --gpu-id 0
+```
+
+测试命令：
+
+```bash
+python test_static_b_diff.py \
+  --tau 1 \
+  --data-path ../Mosmed/test-full \
+  --i-frame-ckp ckp_nll/0001/ckp.tar \
+  --p-frame-ckp ./log_static_b_diff/p-EpXXX-a-b-c.pth \
+  --log-file log-static-b-diff-tau-1.txt \
+  --gpu-id 1
+```
+
+注意事项：
+
+- 当前 diffusion B 帧版本是新实验入口，不应和无扩散 `log_static_b` checkpoint 混用。
+- diffusion 版本 checkpoint 建议单独保存到 `log_static_b_diff/`。
+- 测试日志会写入 `Lossy compressor: diff_sit_static_b`。
+- 这一步只验证“扩散替换有损压缩”；如果之后要验证“残差概率头也使用扩散”，应继续新建独立实验，避免变量混杂。
