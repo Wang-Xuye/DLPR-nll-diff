@@ -285,13 +285,14 @@ class DatasetSeq:
 
 def encode_i_frame(model_i, frames, tau):
     inp = patchify_to_batch(frames[:, 0], 64)
-    out = model_i(inp, tau)
-    rec = unpatchify_from_batch(
-        out["rec_img"].detach(),
-        frames[:, 0].shape[0],
-        frames[:, 0].shape[2],
-        frames[:, 0].shape[3],
-    )
+    with torch.no_grad():
+        out = model_i(inp, tau)
+        rec = unpatchify_from_batch(
+            out["rec_img"].detach(),
+            frames[:, 0].shape[0],
+            frames[:, 0].shape[2],
+            frames[:, 0].shape[3],
+        )
     return out, rec
 
 
@@ -491,6 +492,8 @@ def train(args):
     os.makedirs(args.log_dir, exist_ok=True)
 
     model_i = NearLosslessCompressor_I(192, 5, "3P").to(device)
+    for param in model_i.parameters():
+        param.requires_grad_(False)
     model_p = NearLosslessCompressor_P(192, 5, "3P").to(device)
     criterion = StableRateDistortion(
         lmbda=args.lmbda,
@@ -513,6 +516,7 @@ def train(args):
         print(f"[info] resume={args.resume}")
         print(f"[info] start_epoch={start_epoch}")
 
+    model_i = maybe_wrap_data_parallel(model_i, args.parallel)
     model_p = maybe_wrap_data_parallel(model_p, args.parallel)
 
     optimizer_p, aux_optimizer_p, optimizer_nll_p = configure_optimizers(
@@ -609,4 +613,5 @@ if __name__ == "__main__":
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     train(args)
+
 

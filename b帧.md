@@ -441,3 +441,33 @@ python train_static_b_diff.py \
 - 多卡时建议 `--batch-size` 至少等于可见 GPU 数；如果 batch size 仍为 1，`DataParallel` 基本不会带来加速。
 - 训练保存 checkpoint 时会自动保存未包裹的模型参数，因此新保存的模型不会带 `module.` 前缀。
 - 加载 checkpoint 时仍会自动去掉已有的 `module.` 前缀，所以单卡模型和多卡模型可以互相 resume/test。
+
+## 多卡训练显存注意事项
+
+如果多卡训练仍在 I 帧编码阶段 OOM，请确认使用的是包含本节修改后的版本。当前训练脚本已经做了两项显存修复：
+
+- I 帧模型也会按 `--parallel` 使用 `DataParallel`，不再只让 0 号可见卡承担 I 帧 patch 编码。
+- `encode_i_frame()` 使用 `torch.no_grad()`，冻结的 I 帧模型不会保留反向传播计算图。
+
+四张 24GB 卡建议先这样跑 Diff-SIT 静态 B 帧：
+
+```bash
+python train_static_b_diff.py \
+  --train-path ../Mosmed/train-full \
+  --eval-path ../Mosmed/test-full \
+  --i-frame-ckp ckp_nll/0001/ckp.tar \
+  --save-dir log_static_b_diff \
+  --log-dir logs_static_b_diff \
+  --epochs 10000 \
+  --batch-size 4 \
+  --gpu-id 0,1,2,3 \
+  --parallel auto
+```
+
+如果仍然 OOM，先降到 `--batch-size 2`，或者临时设置：
+
+```bash
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+```
+
+然后重新运行训练命令。
