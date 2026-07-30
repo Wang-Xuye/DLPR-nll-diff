@@ -230,7 +230,7 @@ class StableRateDistortion(nn.Module):
         )
 
         if "diffusion_loss" in output:
-            out["mse_loss"] = output["diffusion_loss"]
+            out["mse_loss"] = output["diffusion_loss"].mean()
         else:
             x_hat = torch.clamp(output["x_hat"], min=-0.5, max=nii_max_f + 0.5)
             out["mse_loss"] = self.mse(x_hat, target)
@@ -617,5 +617,6 @@ if __name__ == "__main__":
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     train(args)
+
 
 
