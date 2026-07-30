@@ -1,4 +1,4 @@
-import argparse
+﻿import argparse
 import os
 import random
 import re
@@ -109,9 +109,33 @@ def parse_resume_epoch(path):
     if match is None:
         return 0
     return int(match.group(1))
+def unwrap_model(model):
+    if isinstance(model, nn.DataParallel):
+        return model.module
+    return model
+
+
+def model_state_dict(model):
+    return unwrap_model(model).state_dict()
+
+
+def maybe_wrap_data_parallel(model, parallel_mode):
+    if parallel_mode == "none":
+        print("[info] data parallel disabled")
+        return model
+    visible_gpus = torch.cuda.device_count()
+    if visible_gpus > 1:
+        print(f"[info] using DataParallel on {visible_gpus} visible GPUs")
+        return nn.DataParallel(model)
+    if parallel_mode == "data_parallel":
+        print("[warn] --parallel data_parallel requested but fewer than 2 GPUs are visible; using single GPU")
+    else:
+        print("[info] single GPU training")
+    return model
 
 
 def configure_optimizers(model, lr, aux_lr):
+    model = unwrap_model(model)
     parameters = {
         n
         for n, p in model.named_parameters()
@@ -286,7 +310,7 @@ def train_one_epoch(
 ):
     model_i.eval()
     model_p.train()
-    device = next(model_i.parameters()).device
+    device = next(unwrap_model(model_i).parameters()).device
 
     for frames in tqdm(train_dataloader, desc="train"):
         frames = frames.to(device).contiguous()
@@ -338,7 +362,7 @@ def train_one_epoch(
 
             out_criterion["loss"].backward()
             if clip_max_norm:
-                nn.utils.clip_grad_norm_(model_p.parameters_wo_cond(), clip_max_norm)
+                nn.utils.clip_grad_norm_(unwrap_model(model_p).parameters_wo_cond(), clip_max_norm)
             if not optimizer_grads_finite(optimizer_p):
                 print(
                     f"[warn] skip non-finite main gradients: "
@@ -352,7 +376,7 @@ def train_one_epoch(
 
             out_criterion["res_bpp_cond"].backward()
             if clip_max_norm:
-                nn.utils.clip_grad_norm_(model_p.parameters_w_cond(), clip_max_norm)
+                nn.utils.clip_grad_norm_(unwrap_model(model_p).parameters_w_cond(), clip_max_norm)
             if not optimizer_grads_finite(optimizer_nll_p):
                 print(
                     f"[warn] skip non-finite residual gradients: "
@@ -364,7 +388,7 @@ def train_one_epoch(
                 break
             optimizer_nll_p.step()
 
-            aux_loss = model_p.lossy_compressor.aux_loss()
+            aux_loss = unwrap_model(model_p).lossy_compressor.aux_loss()
             if tensor_is_finite(aux_loss):
                 aux_loss.backward()
                 if optimizer_grads_finite(aux_optimizer_p):
@@ -386,7 +410,7 @@ def train_one_epoch(
 def eval_epoch(model_i, model_p, criterion, eval_dataloader, epoch, save_dir):
     model_i.eval()
     model_p.eval()
-    device = next(model_i.parameters()).device
+    device = next(unwrap_model(model_i).parameters()).device
 
     img_bpp_p = 0.0
     res_bpp_p = 0.0
@@ -457,7 +481,7 @@ def eval_epoch(model_i, model_p, criterion, eval_dataloader, epoch, save_dir):
             img_bpp_p + res_bpp_cond_p,
         ),
     )
-    torch.save(model_p.state_dict(), ckp_path)
+    torch.save(model_state_dict(model_p), ckp_path)
     print(f"[eval] saved {ckp_path}")
 
 
@@ -492,6 +516,8 @@ def train(args):
         print(f"[info] resume={args.resume}")
         print(f"[info] start_epoch={start_epoch}")
 
+    model_p = maybe_wrap_data_parallel(model_p, args.parallel)
+
     optimizer_p, aux_optimizer_p, optimizer_nll_p = configure_optimizers(
         model_p, lr=args.lr, aux_lr=args.aux_lr
     )
@@ -523,6 +549,7 @@ def train(args):
     )
 
     print(f"[info] CUDA_VISIBLE_DEVICES={os.environ['CUDA_VISIBLE_DEVICES']}")
+    print(f"[info] visible GPU count={torch.cuda.device_count()}")
     print("[info] lossy_compressor=diff_sit_static_b")
     print(f"[info] static ref_map={STATIC_REF_MAP_9}")
 
@@ -575,6 +602,8 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--gpu-id", "--cuda-visible-devices", dest="gpu_id",
                         type=str, default=CUDA_VISIBLE_DEVICES)
+    parser.add_argument("--parallel", choices=["auto", "data_parallel", "none"], default="auto",
+                        help="Multi-GPU mode. auto uses DataParallel when more than one visible GPU is available.")
     return parser.parse_args()
 
 
@@ -584,3 +613,4 @@ if __name__ == "__main__":
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     train(args)
+
