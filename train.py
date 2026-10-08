@@ -1,5 +1,11 @@
 import os
-os.environ['CUDA_VISIBLE_DEVICES'] = '0' # 指定只有第二张GPU对PyTorch可见
+import argparse
+
+_bootstrap = argparse.ArgumentParser(add_help=False)
+_bootstrap.add_argument("--gpu-id", type=str, default=os.environ.get("CUDA_VISIBLE_DEVICES", "0"))
+_bootstrap_args, _ = _bootstrap.parse_known_args()
+os.environ["CUDA_VISIBLE_DEVICES"] = _bootstrap_args.gpu_id
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -7,15 +13,94 @@ import torch.utils.data as data
 from torch.utils.tensorboard import SummaryWriter
 import torch.backends.cudnn as cudnn
 
-from utils.data.datasets import ImageDataset
 from utils.data.transform import build_transforms
 
 import numpy as np
 import math
+from tqdm import tqdm
 
 from nll_model import NearLosslessCompressor, RateDistortion
 
 from global_nii_max import nii_max, nii_max_f
+
+
+class FrameDataset(data.Dataset):
+    """Flatten 2D images and 3D medical-image sequences into single frames."""
+
+    def __init__(self, path_dir, transform=None):
+        self.path_dir = path_dir
+        self.transform = transform
+        self.samples = []
+
+        files = sorted(
+            os.path.join(path_dir, name)
+            for name in os.listdir(path_dir)
+            if name.lower().endswith(".npy")
+        )
+        if not files:
+            raise FileNotFoundError(f"No .npy files found under: {path_dir}")
+
+        for path in files:
+            shape = np.load(path, mmap_mode="r").shape
+            if len(shape) == 2:
+                self.samples.append((path, None, None))
+            elif len(shape) == 3:
+                frame_axis = int(np.argmin(shape))
+                spatial_shape = [shape[i] for i in range(3) if i != frame_axis]
+                if shape[frame_axis] >= min(spatial_shape):
+                    raise ValueError(
+                        f"Cannot infer frame dimension for {path}; shape={shape}."
+                    )
+                for frame_idx in range(shape[frame_axis]):
+                    self.samples.append((path, frame_axis, frame_idx))
+            else:
+                raise ValueError(
+                    f"Expected a 2D image or 3D sequence, got shape={shape} in {path}."
+                )
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, index):
+        path, frame_axis, frame_idx = self.samples[index]
+        img = np.load(path)
+        if frame_axis is not None:
+            img = np.take(img, frame_idx, axis=frame_axis)
+        img = np.asarray(img, dtype=np.float32)
+        if img.ndim != 2:
+            raise ValueError(f"Expected one 2D frame, got shape={img.shape} from {path}")
+        if self.transform is not None:
+            img = self.transform(img)
+        return img
+
+
+def unwrap_model(model):
+    return model.module if isinstance(model, nn.DataParallel) else model
+
+
+def strip_module_prefix(state_dict):
+    if not state_dict:
+        return state_dict
+    has_module_prefix = any(k.startswith("module.") for k in state_dict.keys())
+    if not has_module_prefix:
+        return state_dict
+    return {
+        (k[7:] if k.startswith("module.") else k): v
+        for k, v in state_dict.items()
+    }
+
+
+def load_model_state(model, state_dict):
+    target_model = unwrap_model(model)
+    model_keys = set(target_model.state_dict().keys())
+    candidate = state_dict
+    if not model_keys.intersection(candidate.keys()) and any(k.startswith("module.") for k in candidate.keys()):
+        candidate = strip_module_prefix(candidate)
+    elif model_keys and all(("module." + k) in candidate for k in model_keys):
+        candidate = strip_module_prefix(candidate)
+    target_model.load_state_dict(candidate)
+
+
 def configure_optimizers(model, lr, aux_lr):
 
     parameters = {
@@ -61,13 +146,20 @@ def configure_optimizers(model, lr, aux_lr):
     return optimizer, aux_optimizer, optimizer_nll
 
 
-def train_one_epoch(model, criterion, train_dataloader, optimizer, aux_optimizer, optimizer_nll, train_step, tb_writer=None, clip_max_norm=None):
+def train_one_epoch(model, criterion, train_dataloader, optimizer, aux_optimizer, optimizer_nll, train_step, epoch, tb_writer=None, clip_max_norm=None):
     
     model.train()
     device = next(model.parameters()).device
+    core_model = unwrap_model(model)
     
     train_size = 0
-    for x in train_dataloader:
+    progress = tqdm(
+        train_dataloader,
+        desc=f"Train epoch {epoch + 1}",
+        unit="batch",
+        dynamic_ncols=True,
+    )
+    for x in progress:
         x = x.to(device).contiguous()
         
         optimizer.zero_grad()
@@ -79,15 +171,15 @@ def train_one_epoch(model, criterion, train_dataloader, optimizer, aux_optimizer
         out_criterion = criterion(out, x)
         out_criterion["loss"].backward()
         if clip_max_norm:
-            nn.utils.clip_grad_norm_(model.parameters_wo_cond(), clip_max_norm)
+            nn.utils.clip_grad_norm_(core_model.parameters_wo_cond(), clip_max_norm)
         optimizer.step()
 
         out_criterion["res_bpp_cond"].backward()
         if clip_max_norm:
-            nn.utils.clip_grad_norm_(model.parameters_w_cond(), clip_max_norm)       
+            nn.utils.clip_grad_norm_(core_model.parameters_w_cond(), clip_max_norm)
         optimizer_nll.step()
         
-        aux_loss = model.lossy_compressor.aux_loss()
+        aux_loss = core_model.lossy_compressor.aux_loss()
         aux_loss.backward()
         aux_optimizer.step()
         
@@ -99,9 +191,13 @@ def train_one_epoch(model, criterion, train_dataloader, optimizer, aux_optimizer
             tb_writer.add_scalar('train res bpp', out_criterion["res_bpp"].item(), train_step)
             tb_writer.add_scalar('train res bpp cond', out_criterion["res_bpp_cond"].item(), train_step)
             tb_writer.add_scalar('train bpp', out_criterion["img_bpp"].item() + out_criterion["res_bpp"].item(), train_step)
-            tb_writer.add_scalar('train aux', model.lossy_compressor.aux_loss().item(), train_step)
+            tb_writer.add_scalar('train aux', core_model.lossy_compressor.aux_loss().item(), train_step)
             
         train_size += x.shape[0]
+        progress.set_postfix(
+            loss=f"{out_criterion['loss'].item():.4f}",
+            bpp=f"{(out_criterion['img_bpp'] + out_criterion['res_bpp']).item():.4f}",
+        )
         
     print("train sz:{}".format(train_size))
     return train_step
@@ -111,6 +207,7 @@ def eval_epoch(model, criterion, eval_dataloader, epoch, tb_writer=None):
     
     model.eval()
     device = next(model.parameters()).device
+    core_model = unwrap_model(model)
     
     loss = 0
     img_bpp = 0
@@ -140,7 +237,7 @@ def eval_epoch(model, criterion, eval_dataloader, epoch, tb_writer=None):
             res_bpp += out_criterion["res_bpp"] * N
             res_bpp_cond += out_criterion["res_bpp_cond"] * N
             mse_loss += out_criterion["mse_loss"] * N
-            aux_loss.append(model.lossy_compressor.aux_loss())
+            aux_loss.append(core_model.lossy_compressor.aux_loss())
             
             if save_imgs:
                 x_rec = out["x_hat"].clamp_(0, nii_max)
@@ -177,19 +274,52 @@ def eval_epoch(model, criterion, eval_dataloader, epoch, tb_writer=None):
     return loss, bpp_loss, img_bpp, res_bpp, res_bpp_cond, mse_loss, psnr, aux_loss
         
 
-def train(train_dataloader, eval_dataloader, epochs, ckp_dir, log_dir, resume=False):
+def train(train_dataloader, eval_dataloader, epochs, ckp_dir, log_dir, resume_path=""):
+    parser = argparse.ArgumentParser(description="DLPR baseline training")
+    parser.add_argument("--train-path", type=str, default="../Mosmed/train-s", help="Path to training slices")
+    parser.add_argument("--eval-path", type=str, default="../Mosmed/test-s", help="Path to eval slices")
+    parser.add_argument("--ckp-dir", type=str, default="./ckp_nll/dlpr_baseline", help="Directory to save checkpoints")
+    parser.add_argument("--log-dir", type=str, default="./logs_nll/dlpr_baseline", help="TensorBoard/log directory")
+    parser.add_argument("--epochs", type=int, default=600, help="Number of epochs")
+    parser.add_argument("--batch-size", type=int, default=64, help="Batch size")
+    parser.add_argument("--num-workers", type=int, default=8, help="DataLoader workers")
+    parser.add_argument("--resume-path", type=str, default="", help="Optional checkpoint path to resume from")
+    parser.add_argument("--seed", type=int, default=0, help="Random seed")
+    parser.add_argument("--gpu-id", type=str, default=_bootstrap_args.gpu_id, help="Visible GPU ids, e.g. 0 or 0,1")
+    parser.add_argument("--parallel", type=str, default="auto", choices=["auto", "none", "data_parallel"], help="Parallel training mode")
+    parser.add_argument("--save-every", type=int, default=50, help="Save checkpoint every N epochs")
+    args = parser.parse_args()
+
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+
+    os.makedirs(args.ckp_dir, exist_ok=True)
+    os.makedirs(args.log_dir, exist_ok=True)
+
+    transform_train = build_transforms("p64")
+    transform_eval = build_transforms("p64_centercrop")
+    train_data = FrameDataset(args.train_path, transform=transform_train)
+    train_dataloader = data.DataLoader(train_data, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
+
+    eval_data = FrameDataset(args.eval_path, transform=transform_eval)
+    eval_dataloader = data.DataLoader(eval_data, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
+
     nll_module = NearLosslessCompressor(192, 5, "3P").cuda()
+    use_parallel = args.parallel == "data_parallel" or (args.parallel == "auto" and torch.cuda.device_count() > 1)
+    if use_parallel:
+        nll_module = nn.DataParallel(nll_module)
+
     rd_criterion = RateDistortion(lmbda=0.001)
-    optimizer, aux_optimizer, optimizer_nll = configure_optimizers(nll_module, lr=1e-4, aux_lr=1e-3)
+    optimizer, aux_optimizer, optimizer_nll = configure_optimizers(unwrap_model(nll_module), lr=1e-4, aux_lr=1e-3)
     scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=[350, 390, 430, 470, 510, 550, 590], gamma=0.9, verbose=True)
     scheduler_nll = optim.lr_scheduler.MultiStepLR(optimizer_nll, milestones=[350, 390, 430, 470, 510, 550, 590], gamma=0.9, verbose=True)
 
-    tb_writer = SummaryWriter(log_dir)
+    tb_writer = SummaryWriter(args.log_dir)
 
-    if resume:
-        ckp = torch.load(os.path.join(ckp_dir, "ckp.tar"))
+    if args.resume_path:
+        ckp = torch.load(args.resume_path, map_location="cpu")
         start_epoch = ckp['epoch'] + 1
-        nll_module.load_state_dict(ckp['model_state_dict'])
+        load_model_state(nll_module, ckp['model_state_dict'])
         optimizer.load_state_dict(ckp['optimizer_state_dict'])
         optimizer_nll.load_state_dict(ckp['optimizer_nll_state_dict'])
         aux_optimizer.load_state_dict(ckp['aux_optimizer_state_dict'])
@@ -200,26 +330,59 @@ def train(train_dataloader, eval_dataloader, epochs, ckp_dir, log_dir, resume=Fa
         start_epoch = 0
         train_step = 0
 
-    for epoch in range(start_epoch, epochs):
+    for epoch in range(start_epoch, args.epochs):
         # train
-        train_step = train_one_epoch(nll_module, rd_criterion, train_dataloader, optimizer, aux_optimizer, optimizer_nll, train_step, tb_writer, clip_max_norm=1.0)
+        train_step = train_one_epoch(nll_module, rd_criterion, train_dataloader, optimizer, aux_optimizer, optimizer_nll, train_step, epoch, tb_writer, clip_max_norm=1.0)
         # eval
         loss, bpp_loss, img_bpp, res_bpp, res_bpp_cond, mse_loss, psnr, aux_loss = eval_epoch(nll_module, rd_criterion, eval_dataloader, epoch, tb_writer)
 
         scheduler.step()
         scheduler_nll.step()
 
-        # save model
-        torch.save({
-            'epoch': epoch,
-            'model_state_dict': nll_module.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'optimizer_nll_state_dict': optimizer_nll.state_dict(),
-            'aux_optimizer_state_dict': aux_optimizer.state_dict(),
-            'scheduler': scheduler.state_dict(),
-            'scheduler_nll': scheduler_nll.state_dict(),
-            'step':train_step,
-        }, os.path.join(ckp_dir, "ckp.tar"))
+        # Save at the configured interval and always keep the final epoch.
+        if (epoch + 1) % args.save_every == 0 or epoch == args.epochs - 1:
+            cond_bpp_loss = img_bpp + res_bpp_cond
+            checkpoint = {
+                'epoch': epoch,
+                'model_state_dict': unwrap_model(nll_module).state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'optimizer_nll_state_dict': optimizer_nll.state_dict(),
+                'aux_optimizer_state_dict': aux_optimizer.state_dict(),
+                'scheduler': scheduler.state_dict(),
+                'scheduler_nll': scheduler_nll.state_dict(),
+                'step': train_step,
+                'metrics': {
+                    'loss': loss,
+                    'bpp': bpp_loss,
+                    'img_bpp': img_bpp,
+                    'res_bpp': res_bpp,
+                    'res_bpp_cond': res_bpp_cond,
+                    'cond_bpp': cond_bpp_loss,
+                    'mse_loss': mse_loss,
+                    'psnr': psnr,
+                    'aux_loss': aux_loss,
+                },
+            }
+            torch.save(checkpoint, os.path.join(args.ckp_dir, "ckp.tar"))
+            torch.save(
+                checkpoint,
+                os.path.join(args.ckp_dir, f"ckp-Ep{epoch + 1:04d}.tar"),
+            )
+            model_path = os.path.join(
+                args.ckp_dir,
+                "p-Ep{}-{:.3f}-{:.3f}-{:.3f}.pth".format(
+                    epoch + 1,
+                    img_bpp,
+                    bpp_loss,
+                    cond_bpp_loss,
+                ),
+            )
+            torch.save(unwrap_model(nll_module).state_dict(), model_path)
+            print(
+                f"Checkpoint saved: epoch {epoch + 1}, "
+                f"img_bpp={img_bpp:.4f}, bpp={bpp_loss:.4f}, "
+                f"cond_bpp={cond_bpp_loss:.4f}"
+            )
 
         log_str = "Epoch(Eval):{}, bpp:{}, img bpp:{}, res bpp:{}, res bpp cond:{}, mse:{}, psnr:{}".format(
             epoch, bpp_loss, img_bpp, res_bpp, res_bpp_cond, mse_loss, psnr
@@ -227,32 +390,37 @@ def train(train_dataloader, eval_dataloader, epochs, ckp_dir, log_dir, resume=Fa
         
         print(log_str)  # 终端打印
         
-        with open("log-600-0001.txt", "a") as f:
+        with open(os.path.join(args.log_dir, "train.log"), "a", encoding="utf-8") as f:
             f.write(log_str + "\n")
     tb_writer.close()
-    
-    
-if __name__ == "__main__":
-    
-    ckp_dir = './ckp_nll/0001'
-    log_dir = './logs_nll'
-    epochs = 600
-    resume = False
 
-    seed = 0
-    torch.manual_seed(seed)
-    np.random.seed(seed)
-    
-    if not os.path.exists(ckp_dir):
-        os.makedirs(ckp_dir)
-    
-    transform_train = build_transforms("p64")
-    transform_eval = build_transforms("p64_centercrop")
-    train_data= ImageDataset("/root/autodl-tmp/Mosmed/train-s", transform = transform_train)
-    train_dataloader = data.DataLoader(train_data, batch_size=64, shuffle=True, num_workers=8)
-    
-    eval_data= ImageDataset("/root/autodl-tmp/Mosmed/test-s", transform = transform_eval)
-    eval_dataloader = data.DataLoader(eval_data, batch_size=64, shuffle=False, num_workers=8)
-    
-    train(train_dataloader, eval_dataloader, epochs, ckp_dir, log_dir, resume)
-    
+
+if __name__ == "__main__":
+    train(None, None, None, None, None)
+
+
+'''
+python train.py \
+  --gpu-id 2 \
+  --parallel none \
+  --train-path ../Chaos_nii/train-slice \
+  --eval-path ../Chaos_nii/test-slice \
+  --ckp-dir ./ckp_nll/dlpr_chaos_baseline \
+  --log-dir ./logs_nll/dlpr_chaos_baseline \
+  --epochs 1000 \
+  --batch-size 64 \
+  --num-workers 8 \
+  --save-every 50
+
+python train.py \
+  --gpu-id 0,1,2,3 \
+  --parallel auto \
+  --train-path ../Chaos_nii/train-slice \
+  --eval-path ../Chaos_nii/test-slice \
+  --ckp-dir ./ckp_nll/dlpr_chaos_baseline \
+  --log-dir ./logs_nll/dlpr_chaos_baseline \
+  --epochs 20000 \
+  --batch-size 64 \
+  --num-workers 8 \
+  --save-every 50
+'''
