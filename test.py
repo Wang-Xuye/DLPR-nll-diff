@@ -1,9 +1,14 @@
 import os
-os.environ['CUDA_VISIBLE_DEVICES'] = '1' # 指定只有第二张GPU对PyTorch可见
+import argparse
+
+_bootstrap = argparse.ArgumentParser(add_help=False)
+_bootstrap.add_argument("--gpu-id", type=str, default=os.environ.get("CUDA_VISIBLE_DEVICES", "1"))
+_bootstrap_args, _ = _bootstrap.parse_known_args()
+os.environ["CUDA_VISIBLE_DEVICES"] = _bootstrap_args.gpu_id
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import argparse
 from nll_model_eval_p import NearLosslessCompressor_I, NearLosslessCompressor_P, unpatchify_from_batch, patchify_to_batch
 
 from PIL import Image
@@ -383,12 +388,42 @@ def remove_module_prefix(state_dict, prefix="module."):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--tau", type=int, default=5, help="near-lossless constraint (0, 1, 2, 3, ...)")
+    parser.add_argument(
+        "--tau",
+        type=int,
+        default=1,
+        choices=range(0, 6),
+        help="near-lossless constraint, 0 to 5 (default: 1)",
+    )
+    parser.add_argument(
+        "--gpu-id",
+        type=str,
+        default=_bootstrap_args.gpu_id,
+        help="Visible GPU id, for example 0 or 2",
+    )
+    parser.add_argument(
+        "--data-path",
+        type=str,
+        default="../Mosmed/test-slice",
+        help="Directory containing test sequences",
+    )
+    parser.add_argument(
+        "--i-frame-ckp",
+        type=str,
+        default="/root/autodl-tmp/DLPR-Mosmed-nll/ckp_nll/0001/ckp.tar",
+        help="I-frame DLPR checkpoint",
+    )
+    parser.add_argument(
+        "--p-frame-ckp",
+        type=str,
+        default="/root/autodl-tmp/DLPR-Mosmed-nll/log4-0.03/p-Ep511-0.175-4.871-5.392.pth",
+        help="P-frame checkpoint",
+    )
     args = parser.parse_args()
 
-    tau=0
+    tau = args.tau
 
-    dset = Dataset('../Mosmed/test-slice')
+    dset = Dataset(args.data_path)
     sumz=0
     pn=0
     device = torch.device('cuda')
@@ -399,12 +434,12 @@ if __name__ == "__main__":
     #log=open("log.txt","w")
     
 
-    ckp_I = torch.load("/root/autodl-tmp/DLPR-Mosmed-nll/ckp_nll/0001/ckp.tar", map_location=device)
+    ckp_I = torch.load(args.i_frame_ckp, map_location=device)
     
     nll_module_I.load_state_dict(ckp_I['model_state_dict'])
     nll_module_I.lossy_compressor.update(force=True)
 
-    ckp_P = torch.load("/root/autodl-tmp/DLPR-Mosmed-nll/log4-0.03/p-Ep511-0.175-4.871-5.392.pth", map_location=device)
+    ckp_P = torch.load(args.p_frame_ckp, map_location=device)
     ckp_P=remove_module_prefix(ckp_P, prefix="module.")
     nll_module_P.load_state_dict(ckp_P)
     nll_module_P.lossy_compressor.update(force=True)
@@ -470,3 +505,14 @@ if __name__ == "__main__":
                 P_BPP+=bpsp
                 total_BPP+=bpsp
 print(I_BPP/count, P_BPP/count/7, total_BPP/count/8, m_max_diff)
+
+
+r'''
+# Linux/bash example:
+python test.py \
+  --tau 1 \
+  --gpu-id 2 \
+  --data-path ../Mosmed/test-slice \
+  --i-frame-ckp ./ckp_nll/dlpr_baseline/ckp-Ep0850.tar \
+  --p-frame-ckp ./ckp_nll/dlpr_baseline/ckp-Ep0850.tar
+'''

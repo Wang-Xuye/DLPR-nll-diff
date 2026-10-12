@@ -17,6 +17,9 @@ SCALES_MAX = 256
 SCALES_LEVELS = 64
 
 
+def get_scale_table(min=SCALES_MIN, max=SCALES_MAX, levels=SCALES_LEVELS):
+    return torch.exp(torch.linspace(math.log(min), math.log(max), levels))
+
 
 def patchify_to_batch(x: torch.Tensor, r: int) -> torch.Tensor:
     """
@@ -127,8 +130,8 @@ class Encoder_P(nn.Module):
     def __init__(self, in_ch, out_ch):
         super().__init__()
         self.block1 = AnalysisBlock(in_ch, out_ch)
-        self.block2_extra = AnalysisBlock(in_ch, out_ch)  # 对input2使用的block
-        self.block2_extra2 = AnalysisBlock(in_ch, out_ch)  # 对input2使用的block
+        self.block2_extra = AnalysisBlock(in_ch, out_ch)  # 对input2（第一参考帧）使用的block
+        self.block2_extra2 = AnalysisBlock(in_ch, out_ch)  # 对input3（第二参考帧）使用的block
         
         self.fusion = ResidualFusion(out_ch * 3, out_ch)  # 简单融合层，可替换为更复杂结构
         self.block2 = AnalysisBlock(out_ch, out_ch)
@@ -144,7 +147,7 @@ class Encoder_P(nn.Module):
         
         out1 = self.block1(input1)         # 主路径
         out2 = self.block2_extra(input2)   # 分支路径
-        out3 = self.block2_extra(input3)   # 分支路径     
+        out3 = self.block2_extra2(input3)  # 分支路径
         
         fused = self.fusion(torch.cat([out1, out2, out3], dim=1))  # 通道维度拼接融合
         out = self.block2(fused)
@@ -182,9 +185,9 @@ class Decoder_P(nn.Module):
         super().__init__()
         self.attn1 = SWin_Attention(dim=in_ch, num_heads=8, window_size=4)
         self.block1 = SynthesisBlock(in_ch, in_ch)
-        self.block2_extra = AnalysisBlock(out_ch, in_ch)  # 处理 input2 的路径
-        self.block2_extra2 = AnalysisBlock(out_ch, in_ch)  # 处理 input2 的路径
-        self.fusion = ResidualFusion(in_ch * 3, in_ch)  # 融合 out1 和 out2
+        self.block2_extra = AnalysisBlock(out_ch, in_ch)  # 处理 input2（第一参考帧）的路径
+        self.block2_extra2 = AnalysisBlock(out_ch, in_ch)  # 处理 input3（第二参考帧）的路径
+        self.fusion = ResidualFusion(in_ch * 3, in_ch)  # 融合 out1 / out2 / out3
         self.block2 = SynthesisBlock(in_ch, in_ch)
         self.attn2 = SWin_Attention(dim=in_ch, num_heads=8, window_size=8)
         self.block3 = SynthesisBlock(in_ch, in_ch)
@@ -337,6 +340,39 @@ class LossyCompressor_I(CompressionModel):
             "likelihoods": {"y": y_likelihoods, "z": z_likelihoods}
         }
 
+    def compress(self, input):
+        y = self.encoder(input / nii_max_f)
+        z = self.hyperencoder(y)
+        z_strings = self.entropy_bottleneck.compress(z)
+        z_hat = self.entropy_bottleneck.decompress(z_strings, z.size()[-2:])
+
+        mu_hat, sigma_hat = self.hyperdecoder(z_hat)
+        n, c, h, w = mu_hat.shape
+        indexes = self.gaussian_conditional.build_indexes(sigma_hat.reshape(1, n * c, h, w))
+        y_strings = self.gaussian_conditional.compress(
+            y.reshape(1, n * c, h, w),
+            indexes,
+            means=mu_hat.reshape(1, n * c, h, w),
+        )
+        return {"img_strings": [y_strings, z_strings], "shape": z.size()[-4:]}
+
+    def decompress(self, strings, shape):
+        assert isinstance(strings, list) and len(strings) == 2
+        z_hat = self.entropy_bottleneck.decompress(strings[1], shape[2:])
+
+        mu_hat, sigma_hat = self.hyperdecoder(z_hat)
+        n, c, h, w = mu_hat.shape
+        indexes = self.gaussian_conditional.build_indexes(sigma_hat.reshape(1, n * c, h, w))
+        y_hat = self.gaussian_conditional.decompress(
+            strings[0],
+            indexes,
+            means=mu_hat.reshape(1, n * c, h, w),
+        )
+        y_hat = y_hat.reshape(n, c, h, w)
+        x_hat, res_prior = self.decoder(y_hat)
+        x_hat = torch.floor(x_hat * nii_max_f + 0.5).clamp_(min=0, max=nii_max)
+        return {"x_hat": x_hat, "res_prior": res_prior}
+
     def update(self, scale_table=None, force=False):
         if scale_table is None:
             scale_table = get_scale_table()
@@ -407,6 +443,39 @@ class LossyCompressor_P(CompressionModel):
             "likelihoods": {"y": y_likelihoods, "z": z_likelihoods}
         }
 
+    def compress(self, input, pre, nxt):
+        y = self.encoder(input / nii_max_f, pre / nii_max_f, nxt / nii_max_f)
+        z = self.hyperencoder(y)
+        z_strings = self.entropy_bottleneck.compress(z)
+        z_hat = self.entropy_bottleneck.decompress(z_strings, z.size()[-2:])
+
+        mu_hat, sigma_hat = self.hyperdecoder(z_hat)
+        n, c, h, w = mu_hat.shape
+        indexes = self.gaussian_conditional.build_indexes(sigma_hat.reshape(1, n * c, h, w))
+        y_strings = self.gaussian_conditional.compress(
+            y.reshape(1, n * c, h, w),
+            indexes,
+            means=mu_hat.reshape(1, n * c, h, w),
+        )
+        return {"img_strings": [y_strings, z_strings], "shape": z.size()[-4:]}
+
+    def decompress(self, strings, shape, pre, nxt):
+        assert isinstance(strings, list) and len(strings) == 2
+        z_hat = self.entropy_bottleneck.decompress(strings[1], shape[2:])
+
+        mu_hat, sigma_hat = self.hyperdecoder(z_hat)
+        n, c, h, w = mu_hat.shape
+        indexes = self.gaussian_conditional.build_indexes(sigma_hat.reshape(1, n * c, h, w))
+        y_hat = self.gaussian_conditional.decompress(
+            strings[0],
+            indexes,
+            means=mu_hat.reshape(1, n * c, h, w),
+        )
+        y_hat = y_hat.reshape(n, c, h, w)
+        x_hat, res_prior = self.decoder(y_hat, pre / nii_max_f, nxt / nii_max_f)
+        x_hat = torch.floor(x_hat * nii_max_f + 0.5).clamp_(min=0, max=nii_max)
+        return {"x_hat": x_hat, "res_prior": res_prior}
+
     def update(self, scale_table=None, force=False):
         if scale_table is None:
             scale_table = get_scale_table()
@@ -476,6 +545,12 @@ class NearLosslessCompressor_I(nn.Module):
 
 
     def load_state_dict(self, state_dict):
+        update_registered_buffers(
+            self.lossy_compressor.entropy_bottleneck,
+            "lossy_compressor.entropy_bottleneck",
+            ["_quantized_cdf", "_offset", "_cdf_length"],
+            state_dict,
+        )
         update_registered_buffers(
             self.lossy_compressor.gaussian_conditional,
             "lossy_compressor.gaussian_conditional",
@@ -569,6 +644,12 @@ class NearLosslessCompressor_P(nn.Module):
 
 
     def load_state_dict(self, state_dict):
+        update_registered_buffers(
+            self.lossy_compressor.entropy_bottleneck,
+            "lossy_compressor.entropy_bottleneck",
+            ["_quantized_cdf", "_offset", "_cdf_length"],
+            state_dict,
+        )
         update_registered_buffers(
             self.lossy_compressor.gaussian_conditional,
             "lossy_compressor.gaussian_conditional",
