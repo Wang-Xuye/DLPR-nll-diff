@@ -1,5 +1,4 @@
 import argparse
-import datetime
 import os
 import random
 import re
@@ -27,11 +26,8 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.utils.data as data
-from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data.distributed import DistributedSampler
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
-import torch.distributed as dist
 
 from nll_model_b_diff import (
     NearLosslessCompressor_I,
@@ -105,7 +101,7 @@ def normalize_checkpoint_keys(checkpoint):
 
     Handles three real-world wrappings:
       * {"model_state_dict": ...}                (older train scripts)
-      * "module." prefix                         (nn.DataParallel / DDP saves)
+      * "module." prefix                         (nn.DataParallel saves)
       * "_orig_mod." prefix                      (torch.compile saves)
     plus the old compressai entropy-bottleneck parameter names.
     """
@@ -139,76 +135,9 @@ def parse_resume_epoch(path):
         return 0
     return int(match.group(1))
 def unwrap_model(model):
-    if isinstance(model, (nn.DataParallel, DDP)):
+    if isinstance(model, nn.DataParallel):
         return model.module
     return model
-
-
-def dist_is_initialized():
-    return dist.is_available() and dist.is_initialized()
-
-
-def dist_rank():
-    return dist.get_rank() if dist_is_initialized() else 0
-
-
-def dist_world_size():
-    return dist.get_world_size() if dist_is_initialized() else 1
-
-
-def is_main_process():
-    return dist_rank() == 0
-
-
-def any_rank_true(flag):
-    """OR a flag across ranks so every rank takes the same branch.
-
-    A rank-local `break` would make the ranks issue different numbers of DDP
-    collectives and hang the job, so all skip decisions are taken collectively.
-    Without a process group this is a plain identity.
-    """
-    if not dist_is_initialized():
-        return bool(flag)
-    tensor = torch.tensor([1 if flag else 0], device=torch.cuda.current_device())
-    dist.all_reduce(tensor, op=dist.ReduceOp.MAX)
-    return bool(tensor.item())
-
-
-def setup_distributed(args):
-    """Initialise the process group when the job is launched through torchrun.
-
-    Returns (parallel_mode, local_rank). parallel_mode is "ddp" whenever
-    WORLD_SIZE > 1, otherwise None (plain single-process run).
-    """
-    world_size = int(os.environ.get("WORLD_SIZE", "1"))
-    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-
-    if world_size <= 1:
-        if args.parallel == "ddp":
-            raise RuntimeError(
-                "--parallel ddp must be launched with torchrun, e.g.\n"
-                "  torchrun --nproc_per_node=2 train_static_b_diff.py "
-                "--parallel ddp --gpu-id 0,1 ..."
-            )
-        return None, 0
-
-    if local_rank >= torch.cuda.device_count():
-        raise RuntimeError(
-            f"LOCAL_RANK={local_rank} but only {torch.cuda.device_count()} CUDA device(s) are "
-            f"visible (CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES')}). "
-            f"Give --gpu-id as many ids as --nproc_per_node."
-        )
-    torch.cuda.set_device(local_rank)
-    dist.init_process_group(
-        backend="nccl",
-        init_method="env://",
-        timeout=datetime.timedelta(minutes=args.dist_timeout_min),
-    )
-    if args.parallel == "data_parallel" and is_main_process():
-        print("[warn] WORLD_SIZE>1: running DDP, --parallel data_parallel is ignored")
-    dist.barrier()
-    print(f"[ddp] rank={dist_rank()}/{dist_world_size()} local_rank={local_rank}")
-    return "ddp", local_rank
 
 
 def model_state_dict(model):
@@ -329,19 +258,23 @@ class StableRateDistortion(nn.Module):
         if "diffusion_loss" in output:
             out["mse_loss"] = output["diffusion_loss"].mean()
         else:
+            # eval branch: model.eval() reconstructs through DDIM sampling and has
+            # no diffusion loss to report, so measure the reconstruction in the
+            # same normalised [-1, 1] domain as the training loss, otherwise the
+            # train/eval curves would be on scales that differ by ~nii_max_f**2.
             x_hat = torch.clamp(output["x_hat"], min=-0.5, max=nii_max_f + 0.5)
-            out["mse_loss"] = self.mse(x_hat, target)
+            out["mse_loss"] = self.mse(
+                x_hat / nii_max_f * 2 - 1,
+                target / nii_max_f * 2 - 1,
+            )
 
         if self.diffusion_only:
-            # Stage A: train the generative base layer with no rate pressure at all.
-            # Free of the img_bpp/res_bpp penalty the encoder cannot collapse its
-            # latent to ~0 bpp, which is what happens when the rate terms dominate
-            # a diffusion loss that lives in the normalised [-1, 1] domain.
-            if "diffusion_loss" not in output:
-                raise RuntimeError(
-                    "diffusion_only=True (--stage A) requires the diffusion lossy "
-                    "compressor to return a 'diffusion_loss' entry."
-                )
+            # Stage A optimises the generative base layer only.
+            # Training: the model returns the normalised, SNR-weighted diffusion
+            # loss. Eval: model.eval() does not produce a diffusion loss at all
+            # (it runs DDIM sampling), so fall back to the plain reconstruction
+            # MSE - eval only reports metrics, and the bpp terms are meaningless
+            # while the residual LMM is still untrained.
             out["loss"] = out["mse_loss"]
         else:
             out["loss"] = self.lmbda * out["mse_loss"] + out["img_bpp"] + out["res_bpp"]
@@ -441,7 +374,7 @@ def train_one_epoch(
     model_p.train()
     device = next(unwrap_model(model_i).parameters()).device
 
-    for frames in tqdm(train_dataloader, desc=f"train r{dist_rank()}", disable=not is_main_process()):
+    for frames in tqdm(train_dataloader, desc="train"):
         frames = frames.to(device).contiguous()
         tau = random.randint(1, 5)
         batch, gop_size, _, height, width = frames.shape
@@ -465,21 +398,17 @@ def train_one_epoch(
 
             target = patchify_to_batch(frames[:, idx0], 64)
             out_criterion = criterion(out, target)
-            step_is_bad = (
+            if (
                 not tensor_is_finite(out_criterion["loss"])
                 or not tensor_is_finite(out_criterion["res_bpp_cond"])
                 or not tensor_is_finite(out["rec_img"])
-            )
-            # Every rank must take the same branch, otherwise the DDP collectives
-            # of the following steps desynchronise and the job hangs.
-            if any_rank_true(step_is_bad):
-                if is_main_process():
-                    print(
-                        f"[warn] skip non-finite training step: "
-                        f"tau={tau}, step={step}, target={idx0}, "
-                        f"{format_criterion_values(out_criterion)}, "
-                        f"rec_finite={tensor_is_finite(out['rec_img'])}"
-                    )
+            ):
+                print(
+                    f"[warn] skip non-finite training step: "
+                    f"tau={tau}, step={step}, target={idx0}, "
+                    f"{format_criterion_values(out_criterion)}, "
+                    f"rec_finite={tensor_is_finite(out['rec_img'])}"
+                )
                 optimizer_p.zero_grad()
                 aux_optimizer_p.zero_grad()
                 optimizer_nll_p.zero_grad()
@@ -493,33 +422,14 @@ def train_one_epoch(
             )
             ref_buffer[:, idx0:idx0 + 1] = rec
 
-            # One single backward for every loss term. DDP supports only one
-            # backward pass per iteration (a second pass re-fires the reducer
-            # hooks of parameters that were already reduced), and the three terms
-            # touch disjoint parameter groups - main (lossy compressor,
-            # mask_conv, fusion, residual_compressor), cond (fusion_cond and
-            # residual_compressor_cond, fed by a detached tensor) and quantiles
-            # (aux_loss) - so summing them is exact and keeps the per-optimizer
-            # clipping and stepping order identical to the sequential version.
-            total_loss = out_criterion["loss"]
-            if not getattr(criterion, "diffusion_only", False):
-                total_loss = total_loss + out_criterion["res_bpp_cond"]
-
-            aux_loss = unwrap_model(model_p).lossy_compressor.aux_loss()
-            aux_is_finite = tensor_is_finite(aux_loss)
-            if aux_is_finite:
-                total_loss = total_loss + aux_loss
-
-            total_loss.backward()
-
+            out_criterion["loss"].backward()
             if clip_max_norm:
                 nn.utils.clip_grad_norm_(unwrap_model(model_p).parameters_wo_cond(), clip_max_norm)
-            if any_rank_true(not optimizer_grads_finite(optimizer_p)):
-                if is_main_process():
-                    print(
-                        f"[warn] skip non-finite main gradients: "
-                        f"tau={tau}, step={step}, target={idx0}"
-                    )
+            if not optimizer_grads_finite(optimizer_p):
+                print(
+                    f"[warn] skip non-finite main gradients: "
+                    f"tau={tau}, step={step}, target={idx0}"
+                )
                 optimizer_p.zero_grad()
                 aux_optimizer_p.zero_grad()
                 optimizer_nll_p.zero_grad()
@@ -528,39 +438,39 @@ def train_one_epoch(
 
             if getattr(criterion, "diffusion_only", False):
                 # Stage A: the residual LMM / cond head is not part of the
-                # objective, so it gets no gradient and is not stepped.
+                # objective, so skip its backward (no gradient, no step).
                 optimizer_nll_p.zero_grad()
             else:
+                out_criterion["res_bpp_cond"].backward()
                 if clip_max_norm:
                     nn.utils.clip_grad_norm_(unwrap_model(model_p).parameters_w_cond(), clip_max_norm)
-                if any_rank_true(not optimizer_grads_finite(optimizer_nll_p)):
-                    if is_main_process():
-                        print(
-                            f"[warn] skip non-finite residual gradients: "
-                            f"tau={tau}, step={step}, target={idx0}"
-                        )
+                if not optimizer_grads_finite(optimizer_nll_p):
+                    print(
+                        f"[warn] skip non-finite residual gradients: "
+                        f"tau={tau}, step={step}, target={idx0}"
+                    )
                     optimizer_p.zero_grad()
                     aux_optimizer_p.zero_grad()
                     optimizer_nll_p.zero_grad()
                     break
                 optimizer_nll_p.step()
 
-            if aux_is_finite:
+            aux_loss = unwrap_model(model_p).lossy_compressor.aux_loss()
+            if tensor_is_finite(aux_loss):
+                aux_loss.backward()
                 if optimizer_grads_finite(aux_optimizer_p):
                     aux_optimizer_p.step()
                 else:
-                    if is_main_process():
-                        print(
-                            f"[warn] skip non-finite aux gradients: "
-                            f"tau={tau}, step={step}, target={idx0}"
-                        )
-                    aux_optimizer_p.zero_grad()
-            else:
-                if is_main_process():
                     print(
-                        f"[warn] skip non-finite aux loss: "
+                        f"[warn] skip non-finite aux gradients: "
                         f"tau={tau}, step={step}, target={idx0}"
                     )
+                    aux_optimizer_p.zero_grad()
+            else:
+                print(
+                    f"[warn] skip non-finite aux loss: "
+                    f"tau={tau}, step={step}, target={idx0}"
+                )
                 aux_optimizer_p.zero_grad()
 
             if tb_writer is not None and train_step % 50 == 0:
@@ -583,6 +493,7 @@ def eval_epoch(model_i, model_p, criterion, eval_dataloader, epoch, save_dir, tb
     img_bpp_p = 0.0
     res_bpp_p = 0.0
     res_bpp_cond_p = 0.0
+    mse_loss_p = 0.0
     frame_count = 0
 
     with torch.no_grad():
@@ -630,6 +541,7 @@ def eval_epoch(model_i, model_p, criterion, eval_dataloader, epoch, save_dir, tb
                 img_bpp_p += float(out_criterion["img_bpp"].detach())
                 res_bpp_p += float(out_criterion["res_bpp"].detach())
                 res_bpp_cond_p += float(out_criterion["res_bpp_cond"].detach())
+                mse_loss_p += float(out_criterion["mse_loss"].detach())
                 frame_count += 1
 
     if frame_count == 0:
@@ -639,11 +551,16 @@ def eval_epoch(model_i, model_p, criterion, eval_dataloader, epoch, save_dir, tb
     img_bpp_p /= max(frame_count, 1)
     res_bpp_p /= max(frame_count, 1)
     res_bpp_cond_p /= max(frame_count, 1)
+    mse_loss_p /= max(frame_count, 1)
 
     if tb_writer is not None:
         tb_writer.add_scalar("eval/img_bpp", img_bpp_p, epoch)
         tb_writer.add_scalar("eval/res_bpp", res_bpp_p, epoch)
         tb_writer.add_scalar("eval/res_bpp_cond", res_bpp_cond_p, epoch)
+        # reconstruction quality of the base layer. This is the only meaningful
+        # metric while --stage A runs (the residual LMM is still untrained, so the
+        # res_bpp numbers in the checkpoint name are meaningless there).
+        tb_writer.add_scalar("eval/mse_loss", mse_loss_p, epoch)
         tb_writer.add_scalar("eval/bpp", img_bpp_p + res_bpp_p, epoch)
         tb_writer.add_scalar("eval/bpp_cond", img_bpp_p + res_bpp_cond_p, epoch)
         tb_writer.flush()
@@ -659,18 +576,16 @@ def eval_epoch(model_i, model_p, criterion, eval_dataloader, epoch, save_dir, tb
     )
     os.makedirs(save_dir, exist_ok=True)
     torch.save(model_state_dict(model_p), ckp_path)
-    print(f"[eval] saved {ckp_path}")
+    print(f"[eval] saved {ckp_path} (eval mse_loss={mse_loss_p:.6f}, img_bpp={img_bpp_p:.4f})")
 
 
 def train(args):
     if args.gop_size != 9:
         raise ValueError("Static B-frame ref_map currently supports only --gop-size 9.")
 
-    parallel_mode, local_rank = setup_distributed(args)
-    device = torch.device("cuda", local_rank)
-    if is_main_process():
-        os.makedirs(args.save_dir, exist_ok=True)
-        os.makedirs(args.log_dir, exist_ok=True)
+    device = torch.device("cuda")
+    os.makedirs(args.save_dir, exist_ok=True)
+    os.makedirs(args.log_dir, exist_ok=True)
 
     model_i = NearLosslessCompressor_I(192, 5, "3P").to(device)
     for param in model_i.parameters():
@@ -683,14 +598,13 @@ def train(args):
         likelihood_lower_bound=args.likelihood_lower_bound,
         diffusion_only=(stage == "A"),
     )
-    if is_main_process():
-        if stage == "A":
-            print("[info] stage A: base-layer warm-up, loss = diffusion_loss only (no rate terms)")
-        else:
-            print(
-                f"[info] stage B: joint training, "
-                f"loss = {args.lmbda} * diffusion_loss + img_bpp + res_bpp"
-            )
+    if stage == "A":
+        print("[info] stage A: base-layer warm-up, loss = diffusion_loss only (no rate terms)")
+    else:
+        print(
+            f"[info] stage B: joint training, "
+            f"loss = {args.lmbda} * diffusion_loss + img_bpp + res_bpp"
+        )
 
     ckp_i = torch.load(args.i_frame_ckp, map_location=device, weights_only=False)
     model_i.load_state_dict(normalize_checkpoint_keys(ckp_i))
@@ -698,11 +612,10 @@ def train(args):
 
     if args.resume:
         ckp_p = torch.load(args.resume, map_location=device, weights_only=False)
-        # Single-GPU, DataParallel and DDP checkpoints all resume from here: the
+        # Single-GPU and DataParallel checkpoints both resume from here: the
         # {"model_state_dict": ...} wrapper and the "module." / "_orig_mod."
         # key prefixes are stripped automatically by normalize_checkpoint_keys.
-        if is_main_process():
-            print(f"[info] resume checkpoint: {checkpoint_origin(ckp_p)}")
+        print(f"[info] resume checkpoint: {checkpoint_origin(ckp_p)}")
         try:
             model_p.load_state_dict(normalize_checkpoint_keys(ckp_p))
         except RuntimeError as err:
@@ -717,40 +630,20 @@ def train(args):
     start_epoch = parse_resume_epoch(args.resume)
     if args.start_epoch is not None:
         start_epoch = args.start_epoch
-    if args.resume and is_main_process():
+    if args.resume:
         print(f"[info] resume={args.resume}")
         print(f"[info] start_epoch={start_epoch}")
 
-    if parallel_mode == "ddp":
-        # model_i is frozen and only ever runs under torch.no_grad(), so it stays
-        # un-wrapped: one plain copy per rank, no gradient sync needed.
-        model_p = DDP(
-            model_p,
-            device_ids=[local_rank],
-            output_device=local_rank,
-            # Stage A leaves the residual LMM without gradients, and the cond
-            # head only contributes through the res_bpp_cond term; DDP needs
-            # this flag to tolerate parameters that are used in forward but not
-            # in the merged backward pass.
-            find_unused_parameters=True,
-            # the entropy-bottleneck CDF buffers are identical on every rank
-            # (same checkpoint, deterministic update()), so syncing is pure cost
-            broadcast_buffers=False,
+    model_i = maybe_wrap_data_parallel(model_i, args.parallel)
+    model_p = maybe_wrap_data_parallel(model_p, args.parallel)
+    visible_gpus = torch.cuda.device_count()
+    if visible_gpus > 1 and args.batch_size < visible_gpus:
+        print(
+            f"[warn] batch_size={args.batch_size} < visible GPUs={visible_gpus}: "
+            f"DataParallel cannot split such a batch, so it brings no speedup and "
+            f"may feed empty shards. Use a single GPU (--gpu-id 0 --parallel none) "
+            f"or raise --batch-size to at least {visible_gpus}."
         )
-        if is_main_process():
-            print(f"[ddp] wrapped model_p (world_size={dist_world_size()}, local_rank={local_rank})")
-    else:
-        model_i = maybe_wrap_data_parallel(model_i, args.parallel)
-        model_p = maybe_wrap_data_parallel(model_p, args.parallel)
-        visible_gpus = torch.cuda.device_count()
-        if visible_gpus > 1 and args.batch_size < visible_gpus and is_main_process():
-            print(
-                f"[warn] batch_size={args.batch_size} < visible GPUs={visible_gpus}: "
-                f"DataParallel cannot split such a batch, so it brings no speedup "
-                f"(and may feed empty shards). For clip-level data use DDP instead:\n"
-                f"  torchrun --nproc_per_node={visible_gpus} train_static_b_diff.py "
-                f"--parallel ddp --gpu-id {os.environ['CUDA_VISIBLE_DEVICES']} ..."
-            )
 
     optimizer_p, aux_optimizer_p, optimizer_nll_p = configure_optimizers(
         model_p, lr=args.lr, aux_lr=args.aux_lr
@@ -761,56 +654,35 @@ def train(args):
     scheduler_nll_p = optim.lr_scheduler.MultiStepLR(
         optimizer_nll_p, milestones=args.milestones, gamma=args.gamma
     )
-    tb_writer = SummaryWriter(args.log_dir) if is_main_process() else None
+    tb_writer = SummaryWriter(args.log_dir)
 
     train_dataset = DatasetSeq(args.train_path, gop_size=args.gop_size, random_crop=True)
-    train_sampler = (
-        DistributedSampler(
-            train_dataset,
-            num_replicas=dist_world_size(),
-            rank=dist_rank(),
-            shuffle=True,
-        )
-        if parallel_mode == "ddp"
-        else None
-    )
     train_dataloader = data.DataLoader(
         train_dataset,
         batch_size=args.batch_size,
-        shuffle=train_sampler is None,
-        sampler=train_sampler,
+        shuffle=True,
         num_workers=args.num_workers,
         prefetch_factor=2 if args.num_workers > 0 else None,
         pin_memory=True,
     )
-    # Only rank 0 validates, on the full eval set. DatasetSeq keeps every clip in
-    # RAM, so not building it on the other ranks saves a lot of memory there.
-    if is_main_process():
-        eval_dataset = DatasetSeq(args.eval_path, gop_size=args.gop_size, random_crop=False)
-        eval_dataloader = data.DataLoader(
-            eval_dataset,
-            batch_size=args.batch_size,
-            shuffle=False,
-            num_workers=args.num_workers,
-            prefetch_factor=2 if args.num_workers > 0 else None,
-            pin_memory=True,
-        )
-    else:
-        eval_dataset = None
-        eval_dataloader = None
+    eval_dataset = DatasetSeq(args.eval_path, gop_size=args.gop_size, random_crop=False)
+    eval_dataloader = data.DataLoader(
+        eval_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        prefetch_factor=2 if args.num_workers > 0 else None,
+        pin_memory=True,
+    )
 
-    if is_main_process():
-        print(f"[info] CUDA_VISIBLE_DEVICES={os.environ['CUDA_VISIBLE_DEVICES']}")
-        print(f"[info] visible GPU count={torch.cuda.device_count()}")
-        print(
-            f"[info] parallel={parallel_mode or args.parallel}, "
-            f"world_size={dist_world_size()}, local_rank={local_rank}"
-        )
-        print("[info] lossy_compressor=diff_sit_static_b")
-        print(f"[info] stage={stage}")
-        print(f"[info] diff_embed_dim={args.diff_embed_dim}, lmbda={args.lmbda}")
-        print(f"[info] static ref_map={STATIC_REF_MAP_9}")
-        print(f"[info] train batches per epoch per rank={len(train_dataloader)}")
+    print(f"[info] CUDA_VISIBLE_DEVICES={os.environ['CUDA_VISIBLE_DEVICES']}")
+    print(f"[info] visible GPU count={torch.cuda.device_count()}")
+    print(f"[info] parallel={args.parallel}")
+    print("[info] lossy_compressor=diff_sit_static_b")
+    print(f"[info] stage={stage}")
+    print(f"[info] diff_embed_dim={args.diff_embed_dim}, lmbda={args.lmbda}")
+    print(f"[info] static ref_map={STATIC_REF_MAP_9}")
+    print(f"[info] train batches per epoch={len(train_dataloader)}")
 
     for _ in range(start_epoch):
         scheduler_p.step()
@@ -818,10 +690,6 @@ def train(args):
 
     train_step = 0
     for epoch in range(start_epoch, args.epochs):
-        # DistributedSampler reshuffles per epoch; without this every epoch would
-        # see the exact same shard order on every rank.
-        if train_sampler is not None:
-            train_sampler.set_epoch(epoch)
         train_step = train_one_epoch(
             model_i,
             model_p,
@@ -835,19 +703,11 @@ def train(args):
             clip_max_norm=args.clip_max_norm,
         )
         if epoch % args.eval_interval == 0:
-            if is_main_process():
-                eval_epoch(model_i, model_p, criterion, eval_dataloader, epoch, args.save_dir, tb_writer)
-            if parallel_mode == "ddp":
-                # Hold the other ranks here while rank 0 validates on the full
-                # eval set; the wait is bounded by --dist-timeout-min.
-                dist.barrier()
+            eval_epoch(model_i, model_p, criterion, eval_dataloader, epoch, args.save_dir, tb_writer)
         scheduler_p.step()
         scheduler_nll_p.step()
 
-    if tb_writer is not None:
-        tb_writer.close()
-    if parallel_mode == "ddp":
-        dist.destroy_process_group()
+    tb_writer.close()
 
 
 def parse_args():
@@ -885,15 +745,10 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--gpu-id", "--cuda-visible-devices", dest="gpu_id",
                         type=str, default=CUDA_VISIBLE_DEVICES)
-    parser.add_argument("--parallel", choices=["auto", "data_parallel", "ddp", "none"], default="auto",
-                        help="Multi-GPU mode. 'ddp' needs a torchrun launch "
-                             "(torchrun --nproc_per_node=N ...) and gives each rank its own "
-                             "clips; 'auto'/'data_parallel' use nn.DataParallel in a single "
-                             "process, which only helps when batch_size >= number of GPUs.")
-    parser.add_argument("--dist-timeout-min", type=int, default=240,
-                        help="NCCL collective timeout in minutes for --parallel ddp. Must be "
-                             "larger than one eval pass, because the other ranks wait at a "
-                             "barrier while rank 0 validates.")
+    parser.add_argument("--parallel", choices=["auto", "data_parallel", "none"], default="auto",
+                        help="Single-process nn.DataParallel mode. 'auto' wraps the model when "
+                             "more than one GPU is visible; DataParallel only helps when "
+                             "--batch-size >= number of visible GPUs.")
     return parser.parse_args()
 
 
@@ -965,7 +820,7 @@ python train_static_b_diff.py --stage B \
   --resume ./log_static_b_diff_B/p-Ep<latest>-<img>-<img+res>-<img+res_cond>.pth \
   --gpu-id 0
 
-    单卡、DataParallel、DDP 存出来的 ckpt 都能直接续训：保存时统一用
+    单卡和 DataParallel 存出来的 ckpt 都能直接续训：保存时统一用
     unwrap_model(...).state_dict()（不带 module. 前缀），加载时
     normalize_checkpoint_keys() 会自动剥掉 module. / _orig_mod. 前缀和
     {"model_state_dict": ...} 外壳。启动时会打印识别结果，例如
@@ -973,35 +828,27 @@ python train_static_b_diff.py --stage B \
     注意 log_static_b/ 的普通版 ckpt 与扩散版参数集不同，不能在这里续训，
     脚本会直接报错提示。
 
-(6) 多卡 DDP 训练（每个 rank 分自己的 clip，真正的并行）
-# gpu-id 里的 id 个数要与 --nproc_per_node 一致
-torchrun --nproc_per_node=2 train_static_b_diff.py --parallel ddp \
-  --gpu-id 0,1 \
-  --train-path ../Mosmed/train-full \
-  --eval-path ../Mosmed/test-full \
+(6) 多卡：nn.DataParallel（单进程，--parallel auto 即默认）
+# DataParallel 是把一个 batch 切到多张卡上，所以只有当 batch_size >= GPU 数时
+# 才有加速效果。本任务每个样本是一整个 clip（9 帧），batch_size 通常是 1，
+# 此时 DataParallel 不会更快，直接单卡跑即可。
+python train_static_b_diff.py --stage B --parallel auto --gpu-id 0,1 \
+  --batch-size 2 \
+  --train-path ../Mosmed/train-full --eval-path ../Mosmed/test-full \
   --i-frame-ckp ckp_nll/0001/ckp.tar \
-  --save-dir log_static_b_diff_B_ddp --log-dir logs_static_b_diff_B_ddp \
-  --lmbda 0.1 --epochs 8000 --eval-interval 50 \
-  --lr 1e-4 --aux-lr 1e-3 --batch-size 1 --num-workers 8 \
-  --dist-timeout-min 240
+  --save-dir log_static_b_diff_B --log-dir logs_static_b_diff_B \
+  --lmbda 0.1 --epochs 4000 --eval-interval 50 \
+  --lr 1e-4 --aux-lr 1e-3 --num-workers 8
 
-# 多卡 + Stage A 预热
-torchrun --nproc_per_node=2 train_static_b_diff.py --stage A --parallel ddp \
-  --gpu-id 0,1 --save-dir log_static_b_diff_A_ddp --log-dir logs_static_b_diff_A_ddp \
-  --epochs 1600 --eval-interval 50 --dist-timeout-min 240
+# 只用某几张卡
+CUDA_VISIBLE_DEVICES=2,3 python train_static_b_diff.py --gpu-id 2,3 ...
 
-# 多卡续训（--resume 可以是单卡或任意多卡存出的 ckpt）
-torchrun --nproc_per_node=2 train_static_b_diff.py --stage B --parallel ddp \
-  --gpu-id 0,1 \
-  --resume ./log_static_b_diff_B_ddp/p-Ep<latest>-<img>-<img+res>-<img+res_cond>.pth \
-  --save-dir log_static_b_diff_B_ddp --log-dir logs_static_b_diff_B_ddp \
-  --dist-timeout-min 240
-
-# 只想用某几张卡：--gpu-id 写物理 id，torchrun 的 rank 会映射过去
-CUDA_VISIBLE_DEVICES=2,3 torchrun --nproc_per_node=2 train_static_b_diff.py \
-  --parallel ddp --gpu-id 2,3 --save-dir ... --log-dir ... --dist-timeout-min 240
+# 禁用 DataParallel（推荐给 batch_size=1 的 clip 级训练）
+python train_static_b_diff.py --parallel none --gpu-id 0 ...
 
 (7) 监控：重点看 train/mse_loss（扩散质量）与 train/img_bpp（基础层码率）
+    Stage A 期间看 eval/mse_loss（eval 分支用 DDIM 重建，归一化到与训练同一量纲），
+    此时 res_bpp 还没意义。
 tensorboard --logdir logs_static_b_diff_B
 
 (8) 训练完成后测试（完整命令见 test_static_b_diff.py 结尾的三引号块）
@@ -1012,18 +859,13 @@ python test_static_b_diff.py \
   --log-file log-static-b-diff-tau-0.txt
 
 多卡注意事项
-  * --parallel auto/data_parallel 是单进程 nn.DataParallel：只有 batch_size >=
-    GPU 数才有意义。clip 级别的数据 batch_size=1，所以多卡请用 --parallel ddp
-    （脚本检测到 batch_size < GPU 数时会打印这条提示）。
-  * DDP 下每个 epoch 每个 rank 只过 1/N 的数据；要保持总训练量不变，把
-    --epochs 和 --milestones 一起乘 N。
-  * 只有 rank 0 做 eval、写 tensorboard、存 ckpt；其他 rank 在 eval 期间于
-    dist.barrier() 等待，所以 --dist-timeout-min 必须大于一次完整 eval 的耗时。
-  * 所有 rank 的 skip/break 决策通过 all_reduce 投票（any_rank_true），避免
-    某张卡单独 break 导致集合通信不匹配、任务挂死。
-  * DDP 下每次迭代只做一次 backward：主损失、res_bpp_cond、aux_loss 合并成
-    一次反传（三者参数集互不相交，等价于原来的三次反传）。
-  * model_i 冻结且只在 no_grad 下使用，因此不参与 DDP 包装。
+  * --parallel auto / data_parallel 走的是单进程 nn.DataParallel：模型会复制到
+    每张卡，输入 batch 被切分。batch_size < GPU 数时它会切出空分片，没有加速
+    效果（脚本会打印提示），这两种情况请用 --parallel none 单卡跑。
+  * --gpu-id 里可以写多张卡（如 0,1），DataParallel 会用到全部可见卡；也可以
+    直接用 CUDA_VISIBLE_DEVICES 控制。
+  * ckpt 统一保存为不带 module. 前缀的 state_dict，所以单卡训练与 DataParallel
+    训练之间可以互相续训 / 互相测试。
 
 注意
   --diff-embed-dim 默认 64，必须与测试脚本的 --embed-dim 一致；想和 P 帧
