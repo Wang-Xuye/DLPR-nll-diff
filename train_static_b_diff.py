@@ -829,22 +829,52 @@ python train_static_b_diff.py --stage B \
     脚本会直接报错提示。
 
 (6) 多卡：nn.DataParallel（单进程，--parallel auto 即默认）
-# DataParallel 是把一个 batch 切到多张卡上，所以只有当 batch_size >= GPU 数时
-# 才有加速效果。本任务每个样本是一整个 clip（9 帧），batch_size 通常是 1，
-# 此时 DataParallel 不会更快，直接单卡跑即可。
-python train_static_b_diff.py --stage B --parallel auto --gpu-id 0,1 \
-  --batch-size 2 \
+# DataParallel 是把一个 batch 切到多张卡上，所以 batch_size 必须 >= GPU 数才有
+# 加速；每个样本是一整个 clip（9 帧 512x512），显存基本随 batch 线性增长，
+# 半分辨率以下的特征图可以忽略，全分辨率那几层才是大头。
+
+# 4 卡 24GB：batch 4 = 每张卡 1 个 clip，单卡峰值与"单卡 batch 1"基本相同
+# 先跑这条 2-epoch 冒烟，用 nvidia-smi 确认不 OOM、4 张卡都有占用
+python train_static_b_diff.py --stage A --epochs 2 --eval-interval 1 \
+  --parallel auto --gpu-id 0,1,2,3 --batch-size 4 --lr 2e-4 \
+  --num-workers 8 \
+  --save-dir log_static_b_diff_smoke --log-dir logs_static_b_diff_smoke
+
+# Stage A 预热（4 卡）
+python train_static_b_diff.py --stage A \
+  --parallel auto --gpu-id 0,1,2,3 --batch-size 4 --lr 2e-4 --aux-lr 1e-3 \
+  --num-workers 8 \
+  --train-path ../Mosmed/train-full --eval-path ../Mosmed/test-full \
+  --i-frame-ckp ckp_nll/0001/ckp.tar \
+  --save-dir log_static_b_diff_A --log-dir logs_static_b_diff_A \
+  --epochs 800 --eval-interval 50
+
+# Stage B 联合训练（4 卡，从 Stage A 最新 ckpt 接上）
+python train_static_b_diff.py --stage B \
+  --resume ./log_static_b_diff_A/p-Ep801-<img>-<img+res>-<img+res_cond>.pth \
+  --start-epoch 0 \
+  --parallel auto --gpu-id 0,1,2,3 --batch-size 4 --lr 2e-4 --aux-lr 1e-3 \
+  --num-workers 8 \
   --train-path ../Mosmed/train-full --eval-path ../Mosmed/test-full \
   --i-frame-ckp ckp_nll/0001/ckp.tar \
   --save-dir log_static_b_diff_B --log-dir logs_static_b_diff_B \
-  --lmbda 0.1 --epochs 4000 --eval-interval 50 \
-  --lr 1e-4 --aux-lr 1e-3 --num-workers 8
+  --lmbda 0.1 --epochs 4000 --eval-interval 50
+
+# 显存不够时的两种退法
+#   1) 降到 batch 2 + 只用 2 张卡（每张卡仍是 1 个 clip），lr 相应回到 1e-4
+#      python train_static_b_diff.py --stage A --gpu-id 0,1 --batch-size 2 --lr 1e-4 ...
+#   2) --diff-embed-dim 32：UNet 通道减半，激活大约降到 1/2~1/4；但这会改变网络
+#      结构，必须重新训练，测试时也要带 --embed-dim 32
 
 # 只用某几张卡
-CUDA_VISIBLE_DEVICES=2,3 python train_static_b_diff.py --gpu-id 2,3 ...
+CUDA_VISIBLE_DEVICES=2,3 python train_static_b_diff.py --gpu-id 2,3 --batch-size 2 ...
 
-# 禁用 DataParallel（推荐给 batch_size=1 的 clip 级训练）
+# 单卡：batch_size 只能取 1 时不要开 DataParallel（没有加速，还会切出空分片）
 python train_static_b_diff.py --parallel none --gpu-id 0 ...
+
+# 注：--epochs / --milestones 以"数据遍历次数"计。batch 4 的 1 个 epoch 仍然是
+#     整个训练集，所以 epochs 不用乘 4；只是每个 epoch 的优化步数变成 1/4，
+#     而每步的梯度来自 4 个 clip（更稳），因此 lr 建议从 1e-4 提到 2e-4。
 
 (7) 监控：重点看 train/mse_loss（扩散质量）与 train/img_bpp（基础层码率）
     Stage A 期间看 eval/mse_loss（eval 分支用 DDIM 重建，归一化到与训练同一量纲），
