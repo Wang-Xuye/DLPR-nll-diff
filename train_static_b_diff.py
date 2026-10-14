@@ -38,6 +38,13 @@ from nll_model_b_diff import (
 from global_nii_max import nii_max_f
 
 
+# Rolling training state written next to the weights inside --save-dir. It lets a
+# resumed run continue with the same Adam moments / LR / RNG instead of starting
+# the optimizers from scratch, and it records which weights file it belongs to so
+# it can never be paired with the wrong checkpoint.
+TRAIN_STATE_NAME = "last_train_state.pth"
+TRAIN_STATE_FORMAT = "static-b-diff-train-state-v1"
+
 STATIC_REF_MAP_9 = [
     [0, 0, 0],
     [8, 0, 0],
@@ -134,6 +141,104 @@ def parse_resume_epoch(path):
     if match is None:
         return 0
     return int(match.group(1))
+
+
+def resolve_resume_path(resume, save_dir):
+    """Support --resume latest|auto: pick the highest-epoch p-Ep*.pth in save_dir."""
+    if resume not in ("latest", "auto"):
+        return resume
+    if not os.path.isdir(save_dir):
+        raise RuntimeError(f"--resume {resume}: --save-dir {save_dir} does not exist")
+    candidates = [
+        name
+        for name in os.listdir(save_dir)
+        if name.endswith(".pth") and re.match(r"p-Ep(\d+)-", name)
+    ]
+    if not candidates:
+        raise RuntimeError(f"--resume {resume}: no p-Ep*.pth found under {save_dir}")
+
+    def epoch_of(name):
+        return int(re.match(r"p-Ep(\d+)-", name).group(1))
+
+    latest = max(candidates, key=epoch_of)
+    resolved = os.path.join(save_dir, latest)
+    print(f"[info] --resume {resume} -> {resolved}")
+    return resolved
+
+
+def restore_rng(rng_state):
+    """Restore python / numpy / torch / cuda RNG states saved by save_train_state."""
+    if not rng_state:
+        return
+    try:
+        if "python" in rng_state:
+            random.setstate(rng_state["python"])
+        if "numpy" in rng_state:
+            np.random.set_state(rng_state["numpy"])
+        if "torch" in rng_state:
+            torch.set_rng_state(rng_state["torch"])
+        cuda_states = rng_state.get("cuda")
+        if cuda_states and torch.cuda.is_available():
+            # a checkpoint saved with more GPUs than are visible now is truncated
+            keep = min(len(cuda_states), max(torch.cuda.device_count(), 1))
+            torch.cuda.set_rng_state_all(list(cuda_states)[:keep])
+    except Exception as err:  # RNG restore is a convenience, never fatal
+        print(f"[warn] could not fully restore RNG state: {err}")
+
+
+def save_train_state(ckpt_path, completed_epochs, optimizer_p, aux_optimizer_p,
+                     optimizer_nll_p, train_step):
+    """Write the rolling optimizer/RNG state that pairs with ckpt_path.
+
+    The weights themselves are not duplicated here: ckpt_path stays the anchor and
+    "ckpt_name" makes sure a state file can never be applied to another checkpoint.
+    """
+    state = {
+        "format": TRAIN_STATE_FORMAT,
+        "ckpt_name": os.path.basename(ckpt_path),
+        "completed_epochs": completed_epochs,
+        "train_step": train_step,
+        "optimizer_p": optimizer_p.state_dict(),
+        "aux_optimizer_p": aux_optimizer_p.state_dict(),
+        "optimizer_nll_p": optimizer_nll_p.state_dict(),
+        "rng": {
+            "python": random.getstate(),
+            "numpy": np.random.get_state(),
+            "torch": torch.get_rng_state(),
+            "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+        },
+    }
+    state_path = os.path.join(os.path.dirname(ckpt_path) or ".", TRAIN_STATE_NAME)
+    torch.save(state, state_path)
+    print(f"[state] saved {state_path} (pairs with {state['ckpt_name']}, epochs={completed_epochs})")
+
+
+def find_train_state(ckpt_path, reset_optim):
+    """Load the rolling state that belongs to ckpt_path, or None with a reason."""
+    if reset_optim:
+        print("[state] --reset-optim given: optimizers/RNG restart from scratch")
+        return None
+    state_path = os.path.join(os.path.dirname(ckpt_path) or ".", TRAIN_STATE_NAME)
+    if not os.path.isfile(state_path):
+        print(f"[state] no {state_path}: resuming weights only (optimizers restart from scratch)")
+        return None
+    state = torch.load(state_path, map_location="cpu", weights_only=False)
+    if not isinstance(state, dict) or state.get("format") != TRAIN_STATE_FORMAT:
+        print(f"[state] {state_path} is not a training state: resuming weights only")
+        return None
+    if state.get("ckpt_name") != os.path.basename(ckpt_path):
+        print(
+            f"[state] {state_path} pairs with {state.get('ckpt_name')}, not "
+            f"{os.path.basename(ckpt_path)}: resuming weights only"
+        )
+        return None
+    print(
+        f"[state] using {state_path} (pairs with {state['ckpt_name']}, "
+        f"completed_epochs={state.get('completed_epochs')})"
+    )
+    return state
+
+
 def unwrap_model(model):
     if isinstance(model, nn.DataParallel):
         return model.module
@@ -546,7 +651,7 @@ def eval_epoch(model_i, model_p, criterion, eval_dataloader, epoch, save_dir, tb
 
     if frame_count == 0:
         print(f"[warn] epoch {epoch + 1}: no finite eval frames, checkpoint not saved.")
-        return
+        return None
 
     img_bpp_p /= max(frame_count, 1)
     res_bpp_p /= max(frame_count, 1)
@@ -577,11 +682,14 @@ def eval_epoch(model_i, model_p, criterion, eval_dataloader, epoch, save_dir, tb
     os.makedirs(save_dir, exist_ok=True)
     torch.save(model_state_dict(model_p), ckp_path)
     print(f"[eval] saved {ckp_path} (eval mse_loss={mse_loss_p:.6f}, img_bpp={img_bpp_p:.4f})")
+    return ckp_path
 
 
 def train(args):
     if args.gop_size != 9:
         raise ValueError("Static B-frame ref_map currently supports only --gop-size 9.")
+
+    args.resume = resolve_resume_path(args.resume, args.save_dir)
 
     device = torch.device("cuda")
     os.makedirs(args.save_dir, exist_ok=True)
@@ -610,8 +718,15 @@ def train(args):
     model_i.load_state_dict(normalize_checkpoint_keys(ckp_i))
     model_i.lossy_compressor.update(force=True)
 
+    resume_state = None
     if args.resume:
         ckp_p = torch.load(args.resume, map_location=device, weights_only=False)
+        if isinstance(ckp_p, dict) and ckp_p.get("format") == TRAIN_STATE_FORMAT:
+            raise RuntimeError(
+                f"{args.resume} is the rolling training state ({TRAIN_STATE_NAME}), "
+                f"not a model checkpoint. Point --resume at the matching p-Ep*.pth "
+                f"(or use --resume latest); the state is picked up automatically."
+            )
         # Single-GPU and DataParallel checkpoints both resume from here: the
         # {"model_state_dict": ...} wrapper and the "module." / "_orig_mod."
         # key prefixes are stripped automatically by normalize_checkpoint_keys.
@@ -625,6 +740,7 @@ def train(args):
                 f"log_static_b/*.pth) has a different parameter set and cannot be "
                 f"resumed here; only log_static_b_diff-style checkpoints fit.\n{err}"
             ) from err
+        resume_state = find_train_state(args.resume, args.reset_optim)
     model_p.lossy_compressor.update(force=True)
 
     start_epoch = parse_resume_epoch(args.resume)
@@ -683,12 +799,37 @@ def train(args):
     print(f"[info] diff_embed_dim={args.diff_embed_dim}, lmbda={args.lmbda}")
     print(f"[info] static ref_map={STATIC_REF_MAP_9}")
     print(f"[info] train batches per epoch={len(train_dataloader)}")
+    print(
+        "[info] train state file="
+        + ("disabled (--no-train-state)" if args.no_train_state else TRAIN_STATE_NAME)
+    )
 
     for _ in range(start_epoch):
         scheduler_p.step()
         scheduler_nll_p.step()
 
     train_step = 0
+    if resume_state is not None:
+        # Optimizer moments, LR position (already fast-forwarded above) and RNG are
+        # restored so the run really continues where it stopped instead of
+        # restarting Adam from zero.
+        optimizer_p.load_state_dict(resume_state["optimizer_p"])
+        aux_optimizer_p.load_state_dict(resume_state["aux_optimizer_p"])
+        optimizer_nll_p.load_state_dict(resume_state["optimizer_nll_p"])
+        # load_state_dict() also restores the learning rates stored in the state
+        # file. The CLI stays authoritative, so re-apply what the schedulers just
+        # computed for start_epoch (this is what makes "--resume ... --lr 1e-5" work).
+        for group, lr in zip(optimizer_p.param_groups, scheduler_p.get_last_lr()):
+            group["lr"] = lr
+        for group, lr in zip(optimizer_nll_p.param_groups, scheduler_nll_p.get_last_lr()):
+            group["lr"] = lr
+        train_step = int(resume_state.get("train_step", 0))
+        restore_rng(resume_state.get("rng"))
+        print(
+            f"[state] restored optimizers + RNG, train_step={train_step}, "
+            f"lr={optimizer_p.param_groups[0]['lr']:.3e}"
+        )
+
     for epoch in range(start_epoch, args.epochs):
         train_step = train_one_epoch(
             model_i,
@@ -703,7 +844,18 @@ def train(args):
             clip_max_norm=args.clip_max_norm,
         )
         if epoch % args.eval_interval == 0:
-            eval_epoch(model_i, model_p, criterion, eval_dataloader, epoch, args.save_dir, tb_writer)
+            ckp_path = eval_epoch(
+                model_i, model_p, criterion, eval_dataloader, epoch, args.save_dir, tb_writer
+            )
+            if ckp_path is not None and not args.no_train_state:
+                save_train_state(
+                    ckp_path,
+                    epoch + 1,
+                    optimizer_p,
+                    aux_optimizer_p,
+                    optimizer_nll_p,
+                    train_step,
+                )
         scheduler_p.step()
         scheduler_nll_p.step()
 
@@ -715,7 +867,17 @@ def parse_args():
     parser.add_argument("--train-path", type=str, default="../Mosmed/train-full")
     parser.add_argument("--eval-path", type=str, default="../Mosmed/test-full")
     parser.add_argument("--i-frame-ckp", type=str, default="ckp_nll/0001/ckp.tar")
-    parser.add_argument("--resume", type=str, default=None)
+    parser.add_argument("--resume", type=str, default=None,
+                        help="Checkpoint to continue from: either a p-Ep{N}-...pth path or "
+                             "'latest' to pick the highest-epoch checkpoint inside --save-dir. "
+                             "The matching <save-dir>/last_train_state.pth (Adam moments, RNG, "
+                             "train_step) is restored automatically when present.")
+    parser.add_argument("--reset-optim", action="store_true",
+                        help="With --resume: restart the Adam moments / RNG instead of "
+                             "restoring them (recommended when switching stage/objective).")
+    parser.add_argument("--no-train-state", action="store_true",
+                        help="Do not write the rolling last_train_state.pth. Saves ~1-1.5 GB "
+                             "of disk, but a resume can then only restore the weights.")
     parser.add_argument("--stage", type=str, default="B", choices=["A", "B"],
                         help="A = generative base-layer warm-up (diffusion loss only, no rate "
                              "terms); B = joint training (lmbda * diffusion_loss + img_bpp + "
@@ -815,18 +977,44 @@ python train_static_b_diff.py --stage B \
 python train_static_b_diff.py --stage B --lmbda 0.1 \
   --save-dir log_static_b_diff_v2 --log-dir logs_static_b_diff_v2 --gpu-id 0
 
-(5) 断点续训（指向同一 save-dir 里最新的 p-Ep{N}-...pth）
+(5) 断点续训
+# 最省事：自动挑 --save-dir 里 epoch 最大的 p-Ep*.pth
+python train_static_b_diff.py --stage B --resume latest \
+  --save-dir log_static_b_diff_B --log-dir logs_static_b_diff_B \
+  --parallel auto --gpu-id 0,1,2,3 --batch-size 4 --lr 2e-4
+
+# 指定具体 ckpt
 python train_static_b_diff.py --stage B \
   --resume ./log_static_b_diff_B/p-Ep<latest>-<img>-<img+res>-<img+res_cond>.pth \
-  --gpu-id 0
+  --parallel auto --gpu-id 0,1,2,3 --batch-size 4
 
-    单卡和 DataParallel 存出来的 ckpt 都能直接续训：保存时统一用
+# 跨 stage 想"干净重开"优化器（新目标函数，Adam 矩估计从零开始）
+python train_static_b_diff.py --stage B --resume latest --reset-optim \
+  --start-epoch 0 --save-dir log_static_b_diff_B --log-dir logs_static_b_diff_B
+
+    续训恢复的内容
+      * 模型权重（永远是 p-Ep*.pth）
+      * 三个优化器的状态（主 / cond / quantiles 的 Adam 矩估计）
+      * RNG（python / numpy / torch / cuda）与 train_step
+      * epoch 计数（从文件名 p-Ep{N}- 解析）与 LR 调度（自动快进到该 epoch）
+    这些优化器/RNG 状态存在 <save-dir>/last_train_state.pth（滚动覆盖，约 1~1.5GB），
+    里面记着 ckpt_name，只会配对到它对应的那个 p-Ep*.pth：
+      - 从最新 ckpt 续训 -> 自动带上优化器状态（真·断点续训）
+      - 从更旧的 ckpt 续训 -> 状态文件不匹配，打印提示后只恢复权重
+      - 旧 ckpt（没有状态文件）-> 同上，行为与以前一致
+    --reset-optim      不恢复优化器/RNG，只恢复权重
+    --no-train-state   不写状态文件（省 1~1.5GB 磁盘，但只能恢复权重）
+    --start-epoch N    只覆盖 epoch 计数与 LR 位置，不影响是否恢复优化器状态
+
+    单卡和 DataParallel 存出来的权重都能直接续训：保存时统一用
     unwrap_model(...).state_dict()（不带 module. 前缀），加载时
     normalize_checkpoint_keys() 会自动剥掉 module. / _orig_mod. 前缀和
     {"model_state_dict": ...} 外壳。启动时会打印识别结果，例如
     [info] resume checkpoint: 122 keys with 'module.' (multi-GPU save)
     注意 log_static_b/ 的普通版 ckpt 与扩散版参数集不同，不能在这里续训，
     脚本会直接报错提示。
+    ckpt 与状态文件都只在 eval 时写（每 --eval-interval 个 epoch），想缩短崩溃后
+    的回退距离就把 --eval-interval 调小。
 
 (6) 多卡：nn.DataParallel（单进程，--parallel auto 即默认）
 # DataParallel 是把一个 batch 切到多张卡上，所以 batch_size 必须 >= GPU 数才有
