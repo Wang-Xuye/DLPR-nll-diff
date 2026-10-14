@@ -144,25 +144,35 @@ def parse_resume_epoch(path):
 
 
 def resolve_resume_path(resume, save_dir):
-    """Support --resume latest|auto: pick the highest-epoch p-Ep*.pth in save_dir."""
-    if resume not in ("latest", "auto"):
+    """Resolve the --resume shortcuts.
+
+    "latest" / "auto"   -> highest-epoch p-Ep*.pth inside --save-dir
+    a directory path    -> highest-epoch p-Ep*.pth inside that directory
+                           (handy for stage transitions, e.g. --resume ./log_static_b_diff_A)
+    anything else       -> returned unchanged (a concrete .pth path)
+    """
+    if resume in ("latest", "auto"):
+        search_dir, label = save_dir, resume
+    elif resume and os.path.isdir(resume):
+        search_dir, label = resume, resume
+    else:
         return resume
-    if not os.path.isdir(save_dir):
-        raise RuntimeError(f"--resume {resume}: --save-dir {save_dir} does not exist")
+    if not os.path.isdir(search_dir):
+        raise RuntimeError(f"--resume {label}: directory {search_dir} does not exist")
     candidates = [
         name
-        for name in os.listdir(save_dir)
+        for name in os.listdir(search_dir)
         if name.endswith(".pth") and re.match(r"p-Ep(\d+)-", name)
     ]
     if not candidates:
-        raise RuntimeError(f"--resume {resume}: no p-Ep*.pth found under {save_dir}")
+        raise RuntimeError(f"--resume {label}: no p-Ep*.pth found under {search_dir}")
 
     def epoch_of(name):
         return int(re.match(r"p-Ep(\d+)-", name).group(1))
 
     latest = max(candidates, key=epoch_of)
-    resolved = os.path.join(save_dir, latest)
-    print(f"[info] --resume {resume} -> {resolved}")
+    resolved = os.path.join(search_dir, latest)
+    print(f"[info] --resume {label} -> {resolved}")
     return resolved
 
 
