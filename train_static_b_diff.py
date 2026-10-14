@@ -1115,8 +1115,11 @@ python test_static_b_diff.py \
   diff-sit 链路（embed_dim=32）对齐或省显存时用 32。
   务必换新的 --save-dir：脚本没有 next_available_path，会与旧 run 的
   p-Ep{N}-...pth 撞名覆盖。
-  ckpt 只在 eval 时保存（每 --eval-interval 个 epoch）；Stage A 的 ckpt 文件名里
-  res_bpp 无意义（此时 LMM 未训练），只看 img_bpp，别按它挑 ckpt。
+  ckpt 只在 eval 时保存（每 --eval-interval 个 epoch）。
+  Stage A 期间文件名里的三个 bpp 都无意义（loss 里没有码率项，残差 LMM 也拿不到
+  梯度，likelihood 会一路撞到 --likelihood-lower-bound 的饱和上限），此时只按
+  eval/mse_loss 判断预热门槛、挑 ckpt；Stage B 打开码率项后 img_bpp / res_bpp
+  才会真正下降。
 '''
 
 
