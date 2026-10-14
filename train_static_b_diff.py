@@ -196,17 +196,20 @@ def restore_rng(rng_state):
         print(f"[warn] could not fully restore RNG state: {err}")
 
 
-def save_train_state(ckpt_path, completed_epochs, optimizer_p, aux_optimizer_p,
+def save_train_state(ckpt_path, completed_epochs, stage, optimizer_p, aux_optimizer_p,
                      optimizer_nll_p, train_step):
     """Write the rolling optimizer/RNG state that pairs with ckpt_path.
 
     The weights themselves are not duplicated here: ckpt_path stays the anchor and
     "ckpt_name" makes sure a state file can never be applied to another checkpoint.
+    "stage" records which objective (Stage A = diffusion only, Stage B = joint) the
+    optimizers belong to, so resuming with the wrong --stage can be flagged.
     """
     state = {
         "format": TRAIN_STATE_FORMAT,
         "ckpt_name": os.path.basename(ckpt_path),
         "completed_epochs": completed_epochs,
+        "stage": stage,
         "train_step": train_step,
         "optimizer_p": optimizer_p.state_dict(),
         "aux_optimizer_p": aux_optimizer_p.state_dict(),
@@ -220,7 +223,10 @@ def save_train_state(ckpt_path, completed_epochs, optimizer_p, aux_optimizer_p,
     }
     state_path = os.path.join(os.path.dirname(ckpt_path) or ".", TRAIN_STATE_NAME)
     torch.save(state, state_path)
-    print(f"[state] saved {state_path} (pairs with {state['ckpt_name']}, epochs={completed_epochs})")
+    print(
+        f"[state] saved {state_path} (pairs with {state['ckpt_name']}, "
+        f"stage={stage}, epochs={completed_epochs})"
+    )
 
 
 def find_train_state(ckpt_path, reset_optim):
@@ -244,7 +250,7 @@ def find_train_state(ckpt_path, reset_optim):
         return None
     print(
         f"[state] using {state_path} (pairs with {state['ckpt_name']}, "
-        f"completed_epochs={state.get('completed_epochs')})"
+        f"stage={state.get('stage')}, completed_epochs={state.get('completed_epochs')})"
     )
     return state
 
@@ -835,6 +841,14 @@ def train(args):
             group["lr"] = lr
         train_step = int(resume_state.get("train_step", 0))
         restore_rng(resume_state.get("rng"))
+        state_stage = str(resume_state.get("stage", "")).upper()
+        if state_stage and state_stage != stage:
+            print(
+                f"[warn] this checkpoint was saved during stage {state_stage} but "
+                f"--stage {stage} was requested. That switches the objective mid-run: "
+                f"pass --stage {state_stage} to keep training the same stage, or add "
+                f"--reset-optim if the change is intentional."
+            )
         print(
             f"[state] restored optimizers + RNG, train_step={train_step}, "
             f"lr={optimizer_p.param_groups[0]['lr']:.3e}"
@@ -861,6 +875,7 @@ def train(args):
                 save_train_state(
                     ckp_path,
                     epoch + 1,
+                    stage,
                     optimizer_p,
                     aux_optimizer_p,
                     optimizer_nll_p,
