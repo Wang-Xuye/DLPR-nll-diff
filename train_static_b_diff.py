@@ -606,7 +606,8 @@ def train_one_epoch(
     return train_step
 
 
-def eval_epoch(model_i, model_p, criterion, eval_dataloader, epoch, save_dir, tb_writer=None):
+def eval_epoch(model_i, model_p, criterion, eval_dataloader, epoch, save_dir, tb_writer=None,
+               stage="B"):
     model_i.eval()
     model_p.eval()
     device = next(unwrap_model(model_i).parameters()).device
@@ -686,18 +687,35 @@ def eval_epoch(model_i, model_p, criterion, eval_dataloader, epoch, save_dir, tb
         tb_writer.add_scalar("eval/bpp_cond", img_bpp_p + res_bpp_cond_p, epoch)
         tb_writer.flush()
 
-    ckp_path = os.path.join(
-        save_dir,
-        "p-Ep{}-{:.3f}-{:.3f}-{:.3f}.pth".format(
+    if stage == "A":
+        # Stage A has no rate term, so img_bpp/res_bpp are pinned at the
+        # likelihood clamp and useless for picking a checkpoint. Put the metric
+        # that actually matters (normalised reconstruction MSE) into the name;
+        # mse is zero padded to a fixed width so that
+        #   ls | grep mse | sort -t- -k3,3 | head -1
+        # returns the best checkpoint.
+        ckp_name = "p-Ep{}-mse{:08.5f}-imgbpp{:.2f}-resbpp{:.2f}.pth".format(
+            epoch + 1,
+            mse_loss_p,
+            img_bpp_p,
+            res_bpp_p,
+        )
+    else:
+        # Stage B: the rate terms are optimised, so the usual
+        # p-Ep{N}-{img_bpp}-{img_bpp+res_bpp}-{img_bpp+res_bpp_cond} applies.
+        ckp_name = "p-Ep{}-{:.3f}-{:.3f}-{:.3f}.pth".format(
             epoch + 1,
             img_bpp_p,
             img_bpp_p + res_bpp_p,
             img_bpp_p + res_bpp_cond_p,
-        ),
-    )
+        )
+    ckp_path = os.path.join(save_dir, ckp_name)
     os.makedirs(save_dir, exist_ok=True)
     torch.save(model_state_dict(model_p), ckp_path)
-    print(f"[eval] saved {ckp_path} (eval mse_loss={mse_loss_p:.6f}, img_bpp={img_bpp_p:.4f})")
+    print(
+        f"[eval] saved {ckp_path} (eval mse_loss={mse_loss_p:.6f}, "
+        f"img_bpp={img_bpp_p:.4f}, res_bpp={res_bpp_p:.4f})"
+    )
     return ckp_path
 
 
@@ -869,7 +887,8 @@ def train(args):
         )
         if epoch % args.eval_interval == 0:
             ckp_path = eval_epoch(
-                model_i, model_p, criterion, eval_dataloader, epoch, args.save_dir, tb_writer
+                model_i, model_p, criterion, eval_dataloader, epoch, args.save_dir, tb_writer,
+                stage=stage,
             )
             if ckp_path is not None and not args.no_train_state:
                 save_train_state(
@@ -983,7 +1002,7 @@ python train_static_b_diff.py --stage A \
 (2) Stage B：联合训练（loss = lmbda*diffusion_loss + img_bpp + res_bpp）
     --start-epoch 0 = 只加载权重、把 LR 调度重置到满值（否则按文件名快进）
 python train_static_b_diff.py --stage B \
-  --resume ./log_static_b_diff_A/p-Ep801-<img>-<img+res>-<img+res_cond>.pth \
+  --resume ./log_static_b_diff_A/p-Ep801-mse<xx.xxxxx>-imgbpp<xx.xx>-resbpp<xx.xx>.pth \
   --start-epoch 0 \
   --train-path ../Mosmed/train-full \
   --eval-path ../Mosmed/test-full \
@@ -1064,7 +1083,7 @@ python train_static_b_diff.py --stage A \
 
 # Stage B 联合训练（4 卡，从 Stage A 最新 ckpt 接上）
 python train_static_b_diff.py --stage B \
-  --resume ./log_static_b_diff_A/p-Ep801-<img>-<img+res>-<img+res_cond>.pth \
+  --resume ./log_static_b_diff_A/p-Ep801-mse<xx.xxxxx>-imgbpp<xx.xx>-resbpp<xx.xx>.pth \
   --start-epoch 0 \
   --parallel auto --gpu-id 0,1,2,3 --batch-size 4 --lr 2e-4 --aux-lr 1e-3 \
   --num-workers 8 \
@@ -1115,11 +1134,14 @@ python test_static_b_diff.py \
   diff-sit 链路（embed_dim=32）对齐或省显存时用 32。
   务必换新的 --save-dir：脚本没有 next_available_path，会与旧 run 的
   p-Ep{N}-...pth 撞名覆盖。
-  ckpt 只在 eval 时保存（每 --eval-interval 个 epoch）。
-  Stage A 期间文件名里的三个 bpp 都无意义（loss 里没有码率项，残差 LMM 也拿不到
-  梯度，likelihood 会一路撞到 --likelihood-lower-bound 的饱和上限），此时只按
-  eval/mse_loss 判断预热门槛、挑 ckpt；Stage B 打开码率项后 img_bpp / res_bpp
-  才会真正下降。
+  ckpt 只在 eval 时保存（每 --eval-interval 个 epoch），文件名按 stage 区分：
+    Stage A: p-Ep{N}-mse{08.5f}-imgbpp{xx.xx}-resbpp{xx.xx}.pth
+    Stage B: p-Ep{N}-{img_bpp}-{img_bpp+res_bpp}-{img_bpp+res_bpp_cond}.pth
+  Stage A 期间码率项不在 loss 里（残差 LMM 也拿不到梯度），img_bpp/res_bpp 会一路
+  撞到 --likelihood-lower-bound 的饱和上限（512x512 时 img<=23.82、res<=29.90），
+  所以 Stage A 的名字里放真正能选的指标：归一化域的 eval mse（零填充，字典序=数值序）
+    ls log_static_b_diff_A | grep mse | sort -t- -k3,3 -k2.3,2n | head -1   # 最优 ckpt
+  Stage B 打开码率项后才按码率命名。
 '''
 
 
