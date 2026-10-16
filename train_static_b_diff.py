@@ -332,13 +332,28 @@ def optimizer_grads_finite(optimizer):
     return True
 
 
+def resolve_diff_loss_scale(value):
+    """Resolve --diff-loss-scale.
+
+    "auto" -> (nii_max_f / 2) ** 2, i.e. the factor that turns an MSE in the
+    normalised [-1, 1] domain back into an MSE on the raw [0, 4095] pixels, so
+    that --lmbda keeps the meaning it has in train_static_b.py.
+    """
+    text = str(value).strip().lower()
+    if text == "auto":
+        return (nii_max_f / 2.0) ** 2
+    return float(text)
+
+
 class StableRateDistortion(nn.Module):
-    def __init__(self, lmbda=0.01, likelihood_lower_bound=1e-9, diffusion_only=False):
+    def __init__(self, lmbda=0.01, likelihood_lower_bound=1e-9, diffusion_only=False,
+                 diff_loss_scale=1.0):
         super().__init__()
         self.mse = nn.MSELoss()
         self.lmbda = lmbda
         self.likelihood_lower_bound = likelihood_lower_bound
         self.diffusion_only = diffusion_only
+        self.diff_loss_scale = diff_loss_scale
 
     def safe_likelihood(self, likelihoods):
         return torch.nan_to_num(
@@ -397,13 +412,21 @@ class StableRateDistortion(nn.Module):
             # MSE - eval only reports metrics, and the bpp terms are meaningless
             # while the residual LMM is still untrained.
             out["loss"] = out["mse_loss"]
+            out["mse_weighted"] = out["mse_loss"]
         else:
-            out["loss"] = self.lmbda * out["mse_loss"] + out["img_bpp"] + out["res_bpp"]
+            # The diffusion loss lives in the normalised [-1, 1] domain while the
+            # plain static-B trainer used MSE in the raw [0, 4095] domain, so the
+            # same --lmbda under-weights the distortion by (nii_max_f / 2) ** 2
+            # (~4.19e6) here. Left uncompensated the two rate terms dominate by
+            # several orders of magnitude and the encoder crushes the latent to
+            # ~0 bpp. --diff-loss-scale puts the two recipes on the same scale.
+            out["mse_weighted"] = self.lmbda * self.diff_loss_scale * out["mse_loss"]
+            out["loss"] = out["mse_weighted"] + out["img_bpp"] + out["res_bpp"]
         return out
 
 
 def format_criterion_values(out_criterion):
-    fields = ("loss", "img_bpp", "res_bpp", "res_bpp_cond", "mse_loss")
+    fields = ("loss", "mse_loss", "mse_weighted", "img_bpp", "res_bpp", "res_bpp_cond")
     values = []
     for field in fields:
         value = out_criterion.get(field)
@@ -597,6 +620,9 @@ def train_one_epoch(
             if tb_writer is not None and train_step % 50 == 0:
                 tb_writer.add_scalar("train/loss", float(out_criterion["loss"].detach()), train_step)
                 tb_writer.add_scalar("train/mse_loss", float(out_criterion["mse_loss"].detach()), train_step)
+                tb_writer.add_scalar(
+                    "train/mse_weighted", float(out_criterion["mse_weighted"].detach()), train_step
+                )
                 tb_writer.add_scalar("train/img_bpp", float(out_criterion["img_bpp"].detach()), train_step)
                 tb_writer.add_scalar("train/res_bpp", float(out_criterion["res_bpp"].detach()), train_step)
                 tb_writer.add_scalar(
@@ -735,18 +761,32 @@ def train(args):
     model_p = NearLosslessCompressor_P(192, 5, "3P", embed_dim=args.diff_embed_dim).to(device)
 
     stage = args.stage.upper()
+    diff_loss_scale = resolve_diff_loss_scale(args.diff_loss_scale)
     criterion = StableRateDistortion(
         lmbda=args.lmbda,
         likelihood_lower_bound=args.likelihood_lower_bound,
         diffusion_only=(stage == "A"),
+        diff_loss_scale=diff_loss_scale,
     )
     if stage == "A":
         print("[info] stage A: base-layer warm-up, loss = diffusion_loss only (no rate terms)")
     else:
         print(
             f"[info] stage B: joint training, "
-            f"loss = {args.lmbda} * diffusion_loss + img_bpp + res_bpp"
+            f"loss = {args.lmbda} * {diff_loss_scale:.6g} * diffusion_loss + img_bpp + res_bpp "
+            f"(effective distortion weight {args.lmbda * diff_loss_scale:.6g})"
         )
+        if args.lmbda * diff_loss_scale < 100:
+            print(
+                f"[warn] the effective distortion weight lmbda*scale="
+                f"{args.lmbda * diff_loss_scale:.3g} is tiny next to the rate terms "
+                f"(img_bpp/res_bpp are O(1..30)). The diffusion loss lives in the "
+                f"normalised [-1,1] domain, so with --diff-loss-scale 1.0 the rate terms "
+                f"dominate by orders of magnitude and the encoder crushes the latent "
+                f"(img_bpp -> 0, as in the previous runs). Use "
+                f"--diff-loss-scale auto (={(nii_max_f / 2) ** 2:.3g}) to make --lmbda mean "
+                f"the same thing it does in train_static_b.py."
+            )
 
     ckp_i = torch.load(args.i_frame_ckp, map_location=device, weights_only=False)
     model_i.load_state_dict(normalize_checkpoint_keys(ckp_i))
@@ -935,7 +975,17 @@ def parse_args():
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--num-workers", type=int, default=8)
     parser.add_argument("--gop-size", type=int, default=9)
-    parser.add_argument("--lmbda", type=float, default=0.03)
+    parser.add_argument("--lmbda", type=float, default=0.03,
+                        help="Distortion weight of the diffusion term in the joint stage. The "
+                             "diffusion loss is normalised, so combine it with "
+                             "--diff-loss-scale auto to get the same meaning as in "
+                             "train_static_b.py (otherwise the rate terms dominate by ~4e6).")
+    parser.add_argument("--diff-loss-scale", type=str, default="1.0",
+                        help="Multiplier applied to the diffusion term inside the joint loss. "
+                             "'auto' = (nii_max_f/2)^2 = 4.19e6 rescales the normalised "
+                             "[-1,1] MSE back to the raw [0,4095] domain, which is what makes "
+                             "--lmbda comparable with train_static_b.py. It never changes the "
+                             "logged eval/mse_loss or the checkpoint name.")
     parser.add_argument("--diff-embed-dim", type=int, default=64,
                         help="Embedding width of the diffusion lossy compressor. Keep 64 for "
                              "checkpoints trained with the default; use 32 to match the P-frame "
@@ -978,9 +1028,15 @@ r'''
 
 为什么分两个 stage
   扩散损失在归一化 [-1,1] 域（量级 0.01~1），而普通静态 B 帧的 MSE 在 [0,4095]
-  域（量级 1e5~1e6），同一个 --lmbda 对失真的压力相差约 1e6 倍。直接联合训练时
-  码率项完全主导，编码器会把隐变量压到 ~0（img_bpp≈0），基础层不承载信息。
-  所以先 Stage A 只训扩散基础层，再 Stage B 联合训练。
+  域（量级 1e5~1e6），同一个 --lmbda 对失真的压力相差 (4095/2)^2 = 4.19e6 倍。
+  直接联合训练时码率项完全主导，编码器会把隐变量压到 ~0（img_bpp≈0），基础层
+  不承载信息。所以先 Stage A 只训扩散基础层，再 Stage B 联合训练。
+  注意：只分 stage 还不够！Stage B 必须加 --diff-loss-scale auto 把量纲对齐，
+  否则码率项依然大 1e6 倍、隐变量照样塌缩（实测 p-Ep1-1.786-... ->
+  p-Ep51-0.000-29.897-...）。对齐后 --lmbda 的含义与 train_static_b.py 一致：
+    --lmbda 0.03 --diff-loss-scale auto  ≡  --lmbda 1.26e5
+  另外 Stage B 应从"未饱和"的 Stage A ckpt 起步（文件名里 imgbpp/resbpp 明显
+  小于 23.82/29.90），全饱和的 ckpt 会让残差头没有梯度。
 
 (0) 冒烟：先确认能跑通（2 epoch，每 epoch 都存 ckpt）
 python train_static_b_diff.py --stage A \
@@ -1008,7 +1064,7 @@ python train_static_b_diff.py --stage B \
   --eval-path ../Mosmed/test-full \
   --i-frame-ckp ckp_nll/0001/ckp.tar \
   --save-dir log_static_b_diff_B --log-dir logs_static_b_diff_B \
-  --lmbda 0.1 --epochs 4000 --eval-interval 50 \
+  --lmbda 0.03 --diff-loss-scale auto --epochs 4000 --eval-interval 50 \
   --lr 1e-4 --aux-lr 1e-3 --gpu-id 0
 
 (3) Stage C（可选）：低 lr 精调
@@ -1018,7 +1074,7 @@ python train_static_b_diff.py --stage B \
   --save-dir log_static_b_diff_C --log-dir logs_static_b_diff_C --gpu-id 0
 
 (4) 不分阶段一把梭（等于旧行为，只把失真权重 0.03 提到 0.1）
-python train_static_b_diff.py --stage B --lmbda 0.1 \
+python train_static_b_diff.py --stage B --lmbda 0.03 --diff-loss-scale auto \
   --save-dir log_static_b_diff_v2 --log-dir logs_static_b_diff_v2 --gpu-id 0
 
 (5) 断点续训
@@ -1090,7 +1146,7 @@ python train_static_b_diff.py --stage B \
   --train-path ../Mosmed/train-full --eval-path ../Mosmed/test-full \
   --i-frame-ckp ckp_nll/0001/ckp.tar \
   --save-dir log_static_b_diff_B --log-dir logs_static_b_diff_B \
-  --lmbda 0.1 --epochs 4000 --eval-interval 50
+  --lmbda 0.03 --diff-loss-scale auto --epochs 4000 --eval-interval 50
 
 # 显存不够时的两种退法
 #   1) 降到 batch 2 + 只用 2 张卡（每张卡仍是 1 个 clip），lr 相应回到 1e-4
@@ -1142,6 +1198,14 @@ python test_static_b_diff.py \
   所以 Stage A 的名字里放真正能选的指标：归一化域的 eval mse（零填充，字典序=数值序）
     ls log_static_b_diff_A | grep mse | sort -t- -k3,3 -k2.3,2n | head -1   # 最优 ckpt
   Stage B 打开码率项后才按码率命名。
+  Stage B 的 --lmbda 要配合 --diff-loss-scale auto 使用：loss 里扩散项写成
+  lmbda * diff_loss_scale * diffusion_loss，scale=auto 时 = (4095/2)^2 = 4.19e6，
+  把归一化域的 MSE 折算回原始像素域，--lmbda 才和 train_static_b.py 同义
+  （--lmbda 0.03 --diff-loss-scale auto ≡ --lmbda 1.26e5）。默认 scale=1.0 时脚本
+  会在启动时打印 [warn]，因为那种配置下码率项比失真项大 1e6 倍、必然塌缩。
+  该因子不影响 eval/mse_loss 与文件名里的 mse，调参方向：总 bpp 偏高就调小
+  --lmbda，重建质量差就调大 --lmbda。TensorBoard 里看 train/mse_weighted 与
+  train/img_bpp / train/res_bpp 是否同量级，用来判断平衡是否合理。
 '''
 
 
