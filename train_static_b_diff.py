@@ -507,13 +507,21 @@ class StableRateDistortion(nn.Module):
         # likelihood falls under likelihood_lower_bound, the clamp above flattens
         # it, and the head receives exactly zero gradient - res_bpp then sits on
         # the ceiling (29.897 bits at 1e-9) forever. clamp_frac = 1.0 is the
-        # unmistakable signature.
+        # unmistakable signature. img_clamp_frac plays the same role for the
+        # hyperprior side: when it climbs, img_bpp is drifting towards its own
+        # ceiling (23.824 bits at 512x512) and the number is no longer a rate.
         with torch.no_grad():
             min_log = math.log(self.likelihood_lower_bound)
             out["res_clamp_frac"] = (
                 (output["res_likelihoods"] <= min_log).float().mean()
             )
             out["res_abs_mean"] = (target - output["x_hat"]).abs().mean()
+            img_total = sum(lik.numel() for lik in output["img_likelihoods"].values())
+            img_clamped = sum(
+                (lik <= self.likelihood_lower_bound).sum()
+                for lik in output["img_likelihoods"].values()
+            )
+            out["img_clamp_frac"] = img_clamped.float() / max(img_total, 1)
 
         if "diffusion_loss" in output:
             out["mse_loss"] = output["diffusion_loss"].mean()
@@ -551,7 +559,7 @@ class StableRateDistortion(nn.Module):
 
 def format_criterion_values(out_criterion):
     fields = ("loss", "mse_loss", "mse_weighted", "img_bpp", "res_bpp", "res_bpp_cond",
-              "res_clamp_frac", "res_abs_mean")
+              "img_clamp_frac", "res_clamp_frac", "res_abs_mean")
     values = []
     for field in fields:
         value = out_criterion.get(field)
@@ -767,6 +775,7 @@ def eval_epoch(model_i, model_p, criterion, eval_dataloader, epoch, save_dir, tb
     res_bpp_p = 0.0
     res_bpp_cond_p = 0.0
     mse_loss_p = 0.0
+    img_clamp_frac_p = 0.0
     res_clamp_frac_p = 0.0
     res_abs_mean_p = 0.0
     frame_count = 0
@@ -817,6 +826,7 @@ def eval_epoch(model_i, model_p, criterion, eval_dataloader, epoch, save_dir, tb
                 res_bpp_p += float(out_criterion["res_bpp"].detach())
                 res_bpp_cond_p += float(out_criterion["res_bpp_cond"].detach())
                 mse_loss_p += float(out_criterion["mse_loss"].detach())
+                img_clamp_frac_p += float(out_criterion["img_clamp_frac"])
                 res_clamp_frac_p += float(out_criterion["res_clamp_frac"])
                 res_abs_mean_p += float(out_criterion["res_abs_mean"])
                 frame_count += 1
@@ -829,6 +839,7 @@ def eval_epoch(model_i, model_p, criterion, eval_dataloader, epoch, save_dir, tb
     res_bpp_p /= max(frame_count, 1)
     res_bpp_cond_p /= max(frame_count, 1)
     mse_loss_p /= max(frame_count, 1)
+    img_clamp_frac_p /= max(frame_count, 1)
     res_clamp_frac_p /= max(frame_count, 1)
     res_abs_mean_p /= max(frame_count, 1)
 
@@ -844,6 +855,9 @@ def eval_epoch(model_i, model_p, criterion, eval_dataloader, epoch, save_dir, tb
         # gradient); compare res_abs_mean with the head's sigma to see why.
         tb_writer.add_scalar("eval/res_clamp_frac", res_clamp_frac_p, epoch)
         tb_writer.add_scalar("eval/res_abs_mean", res_abs_mean_p, epoch)
+        # a rising img_clamp_frac means img_bpp is drifting towards its own ceiling
+        # (23.824 bits at 512x512) rather than being a usable rate
+        tb_writer.add_scalar("eval/img_clamp_frac", img_clamp_frac_p, epoch)
         tb_writer.add_scalar("eval/bpp", img_bpp_p + res_bpp_p, epoch)
         tb_writer.add_scalar("eval/bpp_cond", img_bpp_p + res_bpp_cond_p, epoch)
         tb_writer.flush()
@@ -876,8 +890,23 @@ def eval_epoch(model_i, model_p, criterion, eval_dataloader, epoch, save_dir, tb
     print(
         f"[eval] saved {ckp_path} (eval mse_loss={mse_loss_p:.6f}, "
         f"img_bpp={img_bpp_p:.4f}, res_bpp={res_bpp_p:.4f}, "
+        f"img_clamp_frac={img_clamp_frac_p:.3f}, "
         f"res_clamp_frac={res_clamp_frac_p:.3f}, res|mean|={res_abs_mean_p:.1f})"
     )
+    if res_clamp_frac_p >= 0.5:
+        print(
+            f"[warn] res_clamp_frac={res_clamp_frac_p:.2f}: the residual entropy model is "
+            f"saturating, so res_bpp is a clamp reading, not a usable rate. Check "
+            f"res|mean|={res_abs_mean_p:.1f} px against the predicted sigma; rerun with "
+            f"--warm-start-res-head, or lower --likelihood-lower-bound."
+        )
+    if img_clamp_frac_p >= 0.5:
+        print(
+            f"[warn] img_clamp_frac={img_clamp_frac_p:.2f}: the hyperprior is saturating as "
+            f"well (img_bpp is drifting towards its 23.824 ceiling). The rate terms are no "
+            f"longer constraining the base layer - lower --lmbda (with --diff-loss-scale "
+            f"auto) to move back towards a usable operating point."
+        )
     return ckp_path
 
 
