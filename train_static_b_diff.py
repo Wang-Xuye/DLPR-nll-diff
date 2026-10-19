@@ -170,10 +170,50 @@ def resolve_resume_path(resume, save_dir):
     def epoch_of(name):
         return int(re.match(r"p-Ep(\d+)-", name).group(1))
 
-    latest = max(candidates, key=epoch_of)
-    resolved = os.path.join(search_dir, latest)
-    print(f"[info] --resume {label} -> {resolved}")
-    return resolved
+    # Newest first, but skip unreadable files: torch.save() is not atomic, so a run
+    # killed mid-save leaves a truncated *.pth whose name still looks valid. Without
+    # this skip, "--resume latest" would become unusable exactly when it is needed.
+    ordered = sorted(candidates, key=epoch_of, reverse=True)
+    skipped = []
+    for name in ordered:
+        path = os.path.join(search_dir, name)
+        if probe_checkpoint(path):
+            if skipped:
+                print(f"[warn] skipped unreadable checkpoint(s): {', '.join(skipped)}")
+            print(f"[info] --resume {label} -> {path}")
+            return path
+        skipped.append(name)
+    raise RuntimeError(
+        f"--resume {label}: none of the {len(candidates)} p-Ep*.pth under {search_dir} "
+        f"is a readable checkpoint:\n  " + "\n  ".join(skipped)
+    )
+
+
+def probe_checkpoint(path):
+    """Cheap 'is this a readable torch checkpoint' test.
+
+    map_location="meta" parses the archive (so a truncated file fails here) without
+    materialising any tensor, which keeps it fast even for a 400 MB state_dict.
+    """
+    try:
+        if not os.path.isfile(path) or os.path.getsize(path) < 1024:
+            return False
+        torch.load(path, map_location="meta", weights_only=False)
+        return True
+    except Exception:
+        return False
+
+
+def atomic_torch_save(obj, path):
+    """torch.save() to a temporary name, then rename.
+
+    torch.save() is not atomic: a run killed while writing leaves a truncated file
+    under the final name, which later fails with
+    "PytorchStreamReader failed reading zip archive: failed finding central directory".
+    """
+    tmp_path = f"{path}.tmp"
+    torch.save(obj, tmp_path)
+    os.replace(tmp_path, path)
 
 
 def restore_rng(rng_state):
@@ -222,7 +262,7 @@ def save_train_state(ckpt_path, completed_epochs, stage, optimizer_p, aux_optimi
         },
     }
     state_path = os.path.join(os.path.dirname(ckpt_path) or ".", TRAIN_STATE_NAME)
-    torch.save(state, state_path)
+    atomic_torch_save(state, state_path)
     print(
         f"[state] saved {state_path} (pairs with {state['ckpt_name']}, "
         f"stage={stage}, epochs={completed_epochs})"
@@ -369,13 +409,15 @@ def warm_start_residual_head(model_p, dataloader, device, n_batches=8):
         for i, frames in enumerate(dataloader):
             if i >= n_batches:
                 break
+            # frames is (B, T, 1, H, W): indexing (not slicing) the GOP axis keeps
+            # the reference frames at (B, 1, H, W), which is what the model expects
             frames = frames.to(device)
             # go through the (possibly DataParallel-wrapped) full model so the batch
             # is scattered normally; out["x_hat"] is already patchified
             out = model_p(
                 frames[:, idx0],
-                frames[:, idx1:idx1 + 1],
-                frames[:, idx2:idx2 + 1],
+                frames[:, idx1],
+                frames[:, idx2],
                 1,
             )
             target = patchify_to_batch(frames[:, idx0], 64)
@@ -830,7 +872,7 @@ def eval_epoch(model_i, model_p, criterion, eval_dataloader, epoch, save_dir, tb
         )
     ckp_path = os.path.join(save_dir, ckp_name)
     os.makedirs(save_dir, exist_ok=True)
-    torch.save(model_state_dict(model_p), ckp_path)
+    atomic_torch_save(model_state_dict(model_p), ckp_path)
     print(
         f"[eval] saved {ckp_path} (eval mse_loss={mse_loss_p:.6f}, "
         f"img_bpp={img_bpp_p:.4f}, res_bpp={res_bpp_p:.4f}, "
@@ -888,7 +930,19 @@ def train(args):
 
     resume_state = None
     if args.resume:
-        ckp_p = torch.load(args.resume, map_location=device, weights_only=False)
+        if not os.path.isfile(args.resume):
+            raise RuntimeError(f"--resume {args.resume}: file not found")
+        try:
+            ckp_p = torch.load(args.resume, map_location=device, weights_only=False)
+        except Exception as err:
+            raise RuntimeError(
+                f"failed to read {args.resume} "
+                f"({os.path.getsize(args.resume) / 2**20:.1f} MiB): it is not a complete "
+                f"PyTorch checkpoint. torch.save() is not atomic, so a run killed while "
+                f"saving leaves a truncated file behind the correct-looking name. Use an "
+                f"older checkpoint, or pass the directory / 'latest' (unreadable files are "
+                f"skipped automatically now).\n{err}"
+            ) from err
         if isinstance(ckp_p, dict) and ckp_p.get("format") == TRAIN_STATE_FORMAT:
             raise RuntimeError(
                 f"{args.resume} is the rolling training state ({TRAIN_STATE_NAME}), "
@@ -1296,7 +1350,10 @@ python test_static_b_diff.py \
   diff-sit 链路（embed_dim=32）对齐或省显存时用 32。
   务必换新的 --save-dir：脚本没有 next_available_path，会与旧 run 的
   p-Ep{N}-...pth 撞名覆盖。
-  ckpt 只在 eval 时保存（每 --eval-interval 个 epoch），文件名按 stage 区分：
+  ckpt 只在 eval 时保存（每 --eval-interval 个 epoch），保存是"写 .tmp 再 rename"的
+  原子操作，所以进程被杀不会留下截断的 .pth；--resume latest / --resume <目录> 会
+  跳过读不出来的 ckpt（torch.save 本身不是原子的，旧 run 里可能残留坏文件）。
+  文件名按 stage 区分：
     Stage A: p-Ep{N}-mse{08.5f}-imgbpp{xx.xx}-resbpp{xx.xx}.pth
     Stage B: p-Ep{N}-{img_bpp}-{img_bpp+res_bpp}-{img_bpp+res_bpp_cond}.pth
   Stage A 期间码率项不在 loss 里（残差 LMM 也拿不到梯度），img_bpp/res_bpp 会一路
