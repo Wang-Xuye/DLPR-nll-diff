@@ -345,6 +345,75 @@ def resolve_diff_loss_scale(value):
     return float(text)
 
 
+def warm_start_residual_head(model_p, dataloader, device, n_batches=8):
+    """Re-initialise the residual LMM heads to a live operating point.
+
+    A freshly initialised head often predicts a log_sigma far below the actual
+    residual scale (the diffusion U-Net features feeding it are large, so the raw
+    head output saturates). Every residual likelihood then falls under
+    --likelihood-lower-bound, the criterion clamps it flat, and the residual path
+    gets exactly zero gradient: res_bpp sits on the ceiling (29.897 bits at 1e-9)
+    for the whole run while the LMM stays random. Re-initialising the head as a
+    constant predictor (mu = 0, sigma = 1.5 x residual scale) puts it back into the
+    live region, from where it can learn.
+
+    The probe uses ground-truth references and therefore slightly under-estimates
+    the coding residual, hence the 1.5x margin.
+    """
+    model = unwrap_model(model_p)
+    was_training = model_p.training
+    model_p.eval()
+    idx0, idx1, idx2 = STATIC_REF_MAP_9[1]
+    residuals = []
+    with torch.no_grad():
+        for i, frames in enumerate(dataloader):
+            if i >= n_batches:
+                break
+            frames = frames.to(device)
+            # go through the (possibly DataParallel-wrapped) full model so the batch
+            # is scattered normally; out["x_hat"] is already patchified
+            out = model_p(
+                frames[:, idx0],
+                frames[:, idx1:idx1 + 1],
+                frames[:, idx2:idx2 + 1],
+                1,
+            )
+            target = patchify_to_batch(frames[:, idx0], 64)
+            residuals.append(((target - out["x_hat"]) / nii_max_f * 2).flatten())
+    if was_training:
+        model_p.train()
+    if not residuals:
+        print("[warn] --warm-start-res-head: could not read a batch, skipped")
+        return
+
+    res = torch.cat(residuals)
+    scale = max(float(res.std()), float(res.abs().mean()))
+    sigma = min(max(1.5 * scale, 1e-3), 2.0)
+    log_sigma = math.log(sigma)
+
+    # mu = 0, sigma as measured, coeffs = 0, mixture weights = 0 (uniform)
+    head = model.residual_compressor.layers[-1]
+    with torch.no_grad():
+        head.weight.zero_()
+        head.bias.zero_()
+        head.bias[5:10].fill_(log_sigma)
+
+    # Conv2d_cond has no conv bias: the per-condition bias lives in bias_cond
+    cond_head = model.residual_compressor_cond.conv_cond2
+    with torch.no_grad():
+        cond_head.weight.zero_()
+        bias_cond = getattr(cond_head, "bias_cond", None)
+        if bias_cond is not None:
+            bias_cond.weight.zero_()
+            bias_cond.weight[5:10, :].fill_(log_sigma)
+
+    print(
+        f"[init] residual head re-initialised: mu=0, sigma={sigma:.4g} "
+        f"(residual |mean|={float(res.abs().mean()):.4g}, "
+        f"std={float(res.std()):.4g}, n={res.numel()})"
+    )
+
+
 class StableRateDistortion(nn.Module):
     def __init__(self, lmbda=0.01, likelihood_lower_bound=1e-9, diffusion_only=False,
                  diff_loss_scale=1.0):
@@ -391,6 +460,19 @@ class StableRateDistortion(nn.Module):
             / (-math.log(2) * num_pixels)
         )
 
+        # Diagnostics for the "residual head is dead" failure mode: when the
+        # predicted sigma is far below the residual scale, every residual
+        # likelihood falls under likelihood_lower_bound, the clamp above flattens
+        # it, and the head receives exactly zero gradient - res_bpp then sits on
+        # the ceiling (29.897 bits at 1e-9) forever. clamp_frac = 1.0 is the
+        # unmistakable signature.
+        with torch.no_grad():
+            min_log = math.log(self.likelihood_lower_bound)
+            out["res_clamp_frac"] = (
+                (output["res_likelihoods"] <= min_log).float().mean()
+            )
+            out["res_abs_mean"] = (target - output["x_hat"]).abs().mean()
+
         if "diffusion_loss" in output:
             out["mse_loss"] = output["diffusion_loss"].mean()
         else:
@@ -426,7 +508,8 @@ class StableRateDistortion(nn.Module):
 
 
 def format_criterion_values(out_criterion):
-    fields = ("loss", "mse_loss", "mse_weighted", "img_bpp", "res_bpp", "res_bpp_cond")
+    fields = ("loss", "mse_loss", "mse_weighted", "img_bpp", "res_bpp", "res_bpp_cond",
+              "res_clamp_frac", "res_abs_mean")
     values = []
     for field in fields:
         value = out_criterion.get(field)
@@ -642,6 +725,8 @@ def eval_epoch(model_i, model_p, criterion, eval_dataloader, epoch, save_dir, tb
     res_bpp_p = 0.0
     res_bpp_cond_p = 0.0
     mse_loss_p = 0.0
+    res_clamp_frac_p = 0.0
+    res_abs_mean_p = 0.0
     frame_count = 0
 
     with torch.no_grad():
@@ -690,6 +775,8 @@ def eval_epoch(model_i, model_p, criterion, eval_dataloader, epoch, save_dir, tb
                 res_bpp_p += float(out_criterion["res_bpp"].detach())
                 res_bpp_cond_p += float(out_criterion["res_bpp_cond"].detach())
                 mse_loss_p += float(out_criterion["mse_loss"].detach())
+                res_clamp_frac_p += float(out_criterion["res_clamp_frac"])
+                res_abs_mean_p += float(out_criterion["res_abs_mean"])
                 frame_count += 1
 
     if frame_count == 0:
@@ -700,6 +787,8 @@ def eval_epoch(model_i, model_p, criterion, eval_dataloader, epoch, save_dir, tb
     res_bpp_p /= max(frame_count, 1)
     res_bpp_cond_p /= max(frame_count, 1)
     mse_loss_p /= max(frame_count, 1)
+    res_clamp_frac_p /= max(frame_count, 1)
+    res_abs_mean_p /= max(frame_count, 1)
 
     if tb_writer is not None:
         tb_writer.add_scalar("eval/img_bpp", img_bpp_p, epoch)
@@ -709,6 +798,10 @@ def eval_epoch(model_i, model_p, criterion, eval_dataloader, epoch, save_dir, tb
         # metric while --stage A runs (the residual LMM is still untrained, so the
         # res_bpp numbers in the checkpoint name are meaningless there).
         tb_writer.add_scalar("eval/mse_loss", mse_loss_p, epoch)
+        # frac == 1.0 means the residual head is dead (all likelihoods clamped, no
+        # gradient); compare res_abs_mean with the head's sigma to see why.
+        tb_writer.add_scalar("eval/res_clamp_frac", res_clamp_frac_p, epoch)
+        tb_writer.add_scalar("eval/res_abs_mean", res_abs_mean_p, epoch)
         tb_writer.add_scalar("eval/bpp", img_bpp_p + res_bpp_p, epoch)
         tb_writer.add_scalar("eval/bpp_cond", img_bpp_p + res_bpp_cond_p, epoch)
         tb_writer.flush()
@@ -740,7 +833,8 @@ def eval_epoch(model_i, model_p, criterion, eval_dataloader, epoch, save_dir, tb
     torch.save(model_state_dict(model_p), ckp_path)
     print(
         f"[eval] saved {ckp_path} (eval mse_loss={mse_loss_p:.6f}, "
-        f"img_bpp={img_bpp_p:.4f}, res_bpp={res_bpp_p:.4f})"
+        f"img_bpp={img_bpp_p:.4f}, res_bpp={res_bpp_p:.4f}, "
+        f"res_clamp_frac={res_clamp_frac_p:.3f}, res|mean|={res_abs_mean_p:.1f})"
     )
     return ckp_path
 
@@ -882,6 +976,12 @@ def train(args):
         scheduler_p.step()
         scheduler_nll_p.step()
 
+    if args.warm_start_res_head:
+        if stage == "A":
+            print("[info] --warm-start-res-head is ignored in stage A (nothing trains the LMM)")
+        else:
+            warm_start_residual_head(model_p, train_dataloader, device)
+
     train_step = 0
     if resume_state is not None:
         # Optimizer moments, LR position (already fast-forwarded above) and RNG are
@@ -959,6 +1059,12 @@ def parse_args():
     parser.add_argument("--reset-optim", action="store_true",
                         help="With --resume: restart the Adam moments / RNG instead of "
                              "restoring them (recommended when switching stage/objective).")
+    parser.add_argument("--warm-start-res-head", action="store_true",
+                        help="Before joint training, re-initialise the residual LMM heads to "
+                             "mu=0 / sigma=1.5x the measured residual scale. Needed when "
+                             "res_bpp is pinned on the likelihood clamp (e.g. 29.897): in that "
+                             "state the clamp kills the gradient and the head cannot recover "
+                             "by itself.")
     parser.add_argument("--no-train-state", action="store_true",
                         help="Do not write the rolling last_train_state.pth. Saves ~1-1.5 GB "
                              "of disk, but a resume can then only restore the weights.")
@@ -1198,6 +1304,12 @@ python test_static_b_diff.py \
   所以 Stage A 的名字里放真正能选的指标：归一化域的 eval mse（零填充，字典序=数值序）
     ls log_static_b_diff_A | grep mse | sort -t- -k3,3 -k2.3,2n | head -1   # 最优 ckpt
   Stage B 打开码率项后才按码率命名。
+  如果 Stage B 的 ckpt 里 res_bpp 精确等于 29.897（res_bpp_cond 也一样，即文件名
+  第 3 个数 == 第 2 个数），说明残差头"死了"：LMM 预测的 sigma 远小于残差幅度，
+  所有 likelihood 被 --likelihood-lower-bound 压平、梯度恒为 0，头从随机初始化起
+  再也没学过。此时加 --warm-start-res-head 重开，它会把 LMM 头重初始化为
+  mu=0 / sigma=1.5x 实测残差尺度；配套看 eval/res_clamp_frac（=1.0 即死）与
+  eval/res_abs_mean（残差平均幅度）判断是 sigma 太小还是基础层太差。
   Stage B 的 --lmbda 要配合 --diff-loss-scale auto 使用：loss 里扩散项写成
   lmbda * diff_loss_scale * diffusion_loss，scale=auto 时 = (4095/2)^2 = 4.19e6，
   把归一化域的 MSE 折算回原始像素域，--lmbda 才和 train_static_b.py 同义
