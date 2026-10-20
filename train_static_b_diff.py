@@ -385,55 +385,49 @@ def resolve_diff_loss_scale(value):
     return float(text)
 
 
-def warm_start_residual_head(model_p, dataloader, device, n_batches=8):
-    """Re-initialise the residual LMM heads to a live operating point.
+def _probe_gop_residuals(model_i, model_p, frames, device, log_p_min, tau=1):
+    """Walk one clip through the *real* coding path and collect residual stats.
 
-    A freshly initialised head often predicts a log_sigma far below the actual
-    residual scale (the diffusion U-Net features feeding it are large, so the raw
-    head output saturates). Every residual likelihood then falls under
-    --likelihood-lower-bound, the criterion clamps it flat, and the residual path
-    gets exactly zero gradient: res_bpp sits on the ceiling (29.897 bits at 1e-9)
-    for the whole run while the LMM stays random. Re-initialising the head as a
-    constant predictor (mu = 0, sigma = 1.5 x residual scale) puts it back into the
-    live region, from where it can learn.
+    Reconstructed references and DDIM sampling are used (not ground-truth refs):
+    with ground-truth refs the diffusion base can nearly copy the neighbouring
+    frame, so the measured residual ends up orders of magnitude below what the
+    decoder will actually face - which was exactly why an earlier, ground-truth
+    based warm start still left every likelihood clamped.
 
-    The probe uses ground-truth references and therefore slightly under-estimates
-    the coding residual, hence the 1.5x margin.
+    Returns (flattened normalised residuals, current res clamp fraction).
     """
-    model = unwrap_model(model_p)
-    was_training = model_p.training
-    model_p.eval()
-    idx0, idx1, idx2 = STATIC_REF_MAP_9[1]
+    batch, gop, _, height, width = frames.shape
+    ref_buffer = torch.zeros((batch, gop, height, width), device=device)
+    _, rec_i = encode_i_frame(model_i, frames, tau)
+    ref_buffer[:, 0:1] = rec_i
+
     residuals = []
+    n_clamped = 0
+    n_total = 0
     with torch.no_grad():
-        for i, frames in enumerate(dataloader):
-            if i >= n_batches:
-                break
-            # frames is (B, T, 1, H, W): indexing (not slicing) the GOP axis keeps
-            # the reference frames at (B, 1, H, W), which is what the model expects
-            frames = frames.to(device)
-            # go through the (possibly DataParallel-wrapped) full model so the batch
-            # is scattered normally; out["x_hat"] is already patchified
+        for step in range(1, gop):
+            idx0, idx1, idx2 = STATIC_REF_MAP_9[step]
             out = model_p(
                 frames[:, idx0],
-                frames[:, idx1],
-                frames[:, idx2],
-                1,
+                ref_buffer[:, idx1:idx1 + 1],
+                ref_buffer[:, idx2:idx2 + 1],
+                tau,
             )
             target = patchify_to_batch(frames[:, idx0], 64)
             residuals.append(((target - out["x_hat"]) / nii_max_f * 2).flatten())
-    if was_training:
-        model_p.train()
-    if not residuals:
-        print("[warn] --warm-start-res-head: could not read a batch, skipped")
-        return
+            log_lik = out["res_likelihoods"]
+            n_clamped += int((log_lik <= log_p_min).sum())
+            n_total += log_lik.numel()
+            rec = unpatchify_from_batch(
+                out["rec_img"], batch, height, width
+            )
+            ref_buffer[:, idx0:idx0 + 1] = rec
+    return torch.cat(residuals), n_clamped / max(n_total, 1)
 
-    res = torch.cat(residuals)
-    scale = max(float(res.std()), float(res.abs().mean()))
-    sigma = min(max(1.5 * scale, 1e-3), 2.0)
+
+def _init_residual_heads(model, sigma):
+    """Make the residual LMM heads predict a constant mu=0 / sigma / uniform mix."""
     log_sigma = math.log(sigma)
-
-    # mu = 0, sigma as measured, coeffs = 0, mixture weights = 0 (uniform)
     head = model.residual_compressor.layers[-1]
     with torch.no_grad():
         head.weight.zero_()
@@ -449,11 +443,70 @@ def warm_start_residual_head(model_p, dataloader, device, n_batches=8):
             bias_cond.weight.zero_()
             bias_cond.weight[5:10, :].fill_(log_sigma)
 
+
+def warm_start_residual_head(model_i, model_p, dataloader, device,
+                             likelihood_lower_bound=1e-9,
+                             max_clamp_frac=0.05, max_doublings=5):
+    """Calibrate the residual LMM heads onto the real coding distribution.
+
+    A freshly initialised head often predicts a log_sigma far below the actual
+    residual scale, every residual likelihood falls under
+    --likelihood-lower-bound, the criterion clamps it flat and the residual path
+    gets exactly zero gradient: res_bpp then sits on the ceiling (29.897 bits at
+    1e-9) forever while the LMM stays random.
+
+    Instead of guessing sigma from a residual scale, this walks the real coding
+    path (reconstructed references + DDIM), measures the clamp fraction and
+    doubles sigma until it drops below max_clamp_frac. The final sigma is printed
+    in raw pixel units so it can be compared directly with eval's res|mean|.
+    """
+    model = unwrap_model(model_p)
+    was_training = model_p.training
+    model_p.eval()
+    log_p_min = math.log(likelihood_lower_bound)
+
+    frames = None
+    for i, batch in enumerate(dataloader):
+        frames = batch.to(device)
+        break
+    if frames is None:
+        print("[warn] --warm-start-res-head: could not read a batch, skipped")
+        return
+
+    residuals, clamp_before = _probe_gop_residuals(model_i, model_p, frames, device, log_p_min)
+    scale = max(float(residuals.std()), float(residuals.abs().mean()))
+    sigma = min(max(1.5 * scale, 1e-3), 2.0)
+
     print(
-        f"[init] residual head re-initialised: mu=0, sigma={sigma:.4g} "
-        f"(residual |mean|={float(res.abs().mean()):.4g}, "
-        f"std={float(res.std()):.4g}, n={res.numel()})"
+        f"[init] residual probe: |mean|={float(residuals.abs().mean()):.4g} "
+        f"std={float(residuals.std()):.4g} (normalised), "
+        f"res_clamp_frac(before)={clamp_before:.3f}"
     )
+
+    clamp_frac = clamp_before
+    for attempt in range(max_doublings + 1):
+        _init_residual_heads(model, sigma)
+        if attempt > 0:
+            _, clamp_frac = _probe_gop_residuals(
+                model_i, model_p, frames, device, log_p_min
+            )
+        print(
+            f"[init] try {attempt}: sigma={sigma:.4g} "
+            f"(= {sigma * nii_max_f / 2:.1f} px) -> res_clamp_frac={clamp_frac:.3f}"
+        )
+        if clamp_frac <= max_clamp_frac:
+            break
+        sigma = min(sigma * 2.0, 2.0)
+    else:
+        print(
+            f"[warn] --warm-start-res-head could not get res_clamp_frac under "
+            f"{max_clamp_frac}; the residual may simply be too large - check "
+            f"eval/res_abs_mean against the printed sigma, or lower "
+            f"--likelihood-lower-bound."
+        )
+
+    if was_training:
+        model_p.train()
 
 
 class StableRateDistortion(nn.Module):
@@ -1063,7 +1116,13 @@ def train(args):
         if stage == "A":
             print("[info] --warm-start-res-head is ignored in stage A (nothing trains the LMM)")
         else:
-            warm_start_residual_head(model_p, train_dataloader, device)
+            warm_start_residual_head(
+                model_i,
+                model_p,
+                train_dataloader,
+                device,
+                likelihood_lower_bound=args.likelihood_lower_bound,
+            )
 
     train_step = 0
     if resume_state is not None:
