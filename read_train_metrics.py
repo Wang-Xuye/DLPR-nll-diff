@@ -75,6 +75,44 @@ def match_checkpoints(save_dir, epochs):
     return found
 
 
+def pick_stage_a(scalars, tol):
+    """Apply the documented Stage A selection rule.
+
+    1. keep the eval points whose mse is within `tol` of the best (the plateau);
+    2. among them prefer the lowest img_bpp (least saturated hyperprior - Stage A
+       never trains the rate side, so img_bpp drifts towards its clamp ceiling);
+    3. then the lowest mse, then the earliest epoch.
+    """
+    mse = scalars.get("eval/mse_loss")
+    if not mse:
+        raise SystemExit("eval/mse_loss not found, cannot rank Stage A checkpoints")
+    img = scalars.get("eval/img_bpp", {})
+    best = min(mse.values())
+    plateau = sorted(step for step in mse if mse[step] <= best * (1.0 + tol))
+
+    def key(step):
+        # round img_bpp the way the checkpoint name does, so sub-1% jitter does not
+        # dominate the ordering
+        return (round(float(img.get(step, float("inf"))), 2), mse[step], step)
+
+    chosen = min(plateau, key=key)
+
+    print()
+    print(f"[pick] Stage A candidates inside the mse plateau (tolerance {tol * 100:.0f}%):")
+    print(f"{'epoch':>6}  {'eval/mse_loss':>15}  {'eval/img_bpp':>13}  chosen")
+    for step in plateau:
+        img_value = img.get(step)
+        img_text = f"{img_value:>13.4g}" if img_value is not None else f"{'n/a':>13}"
+        mark = "  <=" if step == chosen else ""
+        print(f"{step + 1:>6}  {mse[step]:>15.6g}  {img_text}{mark}")
+    print(
+        f"[pick] -> epoch {chosen + 1}: lowest img_bpp inside the plateau, "
+        f"then lowest mse (img_bpp={float(img.get(chosen, float('nan'))):.4g}, "
+        f"mse={mse[chosen]:.6g})"
+    )
+    return chosen
+
+
 def fmt(value, width=13):
     return " " * width if value is None else f"{value:.6g}".rjust(width)
 
@@ -92,6 +130,13 @@ def main():
     parser.add_argument("--rank-by", type=str, default="min",
                         choices=["min", "max"],
                         help="Whether a lower or higher value of --tag is better")
+    parser.add_argument("--pick-stage-a", action="store_true",
+                        help="Rank Stage A checkpoints with the documented rule: mse "
+                             "plateau, then lowest img_bpp, then lowest mse, then "
+                             "earliest epoch")
+    parser.add_argument("--plateau-tol", type=float, default=0.10,
+                        help="Relative mse tolerance that defines the plateau "
+                             "(default 0.10 = within 10%% of the best)")
     args = parser.parse_args()
 
     scalars, files = load_scalars(args.log_dir)
@@ -135,7 +180,22 @@ def main():
             print(f"[hint] last {len(tail)} eval points span {spread * 100:.1f}% of the best value")
             print("       still improving -> keep going with --stage A (same-stage resume)")
             print("       plateaued      -> start --stage B from the checkpoint above")
-            print("                         (--start-epoch 0 --reset-optim --lmbda 0.1)")
+            print("                         (--start-epoch 0 --reset-optim "
+                  "--warm-start-res-head --lmbda 0.015 --diff-loss-scale auto)")
+            print("       use --pick-stage-a to rank the plateau candidates properly")
+
+    if args.pick_stage_a:
+        chosen = pick_stage_a(scalars, args.plateau_tol)
+        checkpoints = match_checkpoints(args.save_dir, scalars["eval/mse_loss"].keys())
+        if chosen + 1 in checkpoints:
+            print(f"[pick] {checkpoints[chosen + 1]}")
+            print(
+                "[pick] start Stage B with: --stage B --resume <that path> "
+                "--start-epoch 0 --reset-optim --warm-start-res-head "
+                "--lmbda 0.015 --diff-loss-scale auto"
+            )
+        else:
+            print("[pick] (no matching p-Ep*.pth found; check --save-dir)")
 
 
 if __name__ == "__main__":
