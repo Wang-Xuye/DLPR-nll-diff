@@ -528,7 +528,7 @@ if __name__ == "__main__":
                 print("p: bpsp:{:.4f}, img_bpsp:{:.4f}, res_bpsp:{:.4f}, size:{:.4f}".format(bpsp, img_bpsp, res_bpsp, nll_sz*8))
                 P_BPP+=bpsp
                 total_BPP+=bpsp
-print(I_BPP/count, P_BPP/count/7, total_BPP/count/8, m_max_diff)
+    print(I_BPP/count, P_BPP/count/7, total_BPP/count/8, m_max_diff)
 
 
 r'''
