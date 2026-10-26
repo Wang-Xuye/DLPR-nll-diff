@@ -385,6 +385,30 @@ def remove_module_prefix(state_dict, prefix="module."):
     return new_state_dict
 
 
+def load_checkpoint_state(model, checkpoint):
+    """Load an I-frame checkpoint into `model` in place.
+
+    Accepts either a bare state_dict or the legacy {"model_state_dict": ...}
+    wrapper (which is what ckp_nll/0001/ckp.tar uses), strips the "module." /
+    "_orig_mod." prefixes and converts the old compressai entropy-bottleneck
+    parameter names (_matrix0 -> matrices.0, and likewise _bias/_factor), which
+    matches test_static_b.py's normalize_checkpoint_keys.
+    """
+    if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+        state_dict = checkpoint["model_state_dict"]
+    else:
+        state_dict = checkpoint
+    state_dict = remove_module_prefix(state_dict, prefix="module.")
+    state_dict = remove_module_prefix(state_dict, prefix="_orig_mod.")
+    state_dict = {
+        key.replace(".entropy_bottleneck._matrix", ".entropy_bottleneck.matrices.")
+        .replace(".entropy_bottleneck._bias", ".entropy_bottleneck.biases.")
+        .replace(".entropy_bottleneck._factor", ".entropy_bottleneck.factors."): value
+        for key, value in state_dict.items()
+    }
+    model.load_state_dict(state_dict)
+    return model
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
