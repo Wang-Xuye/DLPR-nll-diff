@@ -464,6 +464,12 @@ def main():
              "checkpoint (train_static_b_diff.py --latent-ch). Default 192 is what every "
              "checkpoint so far was trained with.",
     )
+    parser.add_argument(
+        "--ref-cond-entropy",
+        action="store_true",
+        help="Must match the trained checkpoint: condition the latent entropy model on "
+             "the reference frames (train_static_b_diff.py --ref-cond-entropy).",
+    )
     parser.add_argument("--gpu-id", "--cuda-visible-devices", dest="gpu_id", type=str, default=CUDA_VISIBLE_DEVICES)
     args = parser.parse_args()
 
@@ -474,7 +480,8 @@ def main():
     dataset = Dataset(args.data_path)
     model_i = NearLosslessCompressor_I(192, 5, "3P").eval().to(device)
     model_p = NearLosslessCompressor_P(
-        args.latent_ch, 5, "3P", sample_steps=args.steps, embed_dim=args.embed_dim
+        args.latent_ch, 5, "3P", sample_steps=args.steps, embed_dim=args.embed_dim,
+        ref_cond_entropy=args.ref_cond_entropy,
     ).eval().to(device)
 
     ckp_i = torch.load(args.i_frame_ckp, map_location=device, weights_only=False)
@@ -482,7 +489,14 @@ def main():
     model_i.lossy_compressor.update(force=True)
 
     ckp_p = torch.load(args.p_frame_ckp, map_location=device, weights_only=False)
-    model_p.load_state_dict(normalize_checkpoint_keys(ckp_p))
+    sd_p = normalize_checkpoint_keys(ckp_p)
+    missing = [k for k in model_p.state_dict() if k not in sd_p]
+    new_only = [k for k in missing if k.startswith("lossy_compressor.ref_sigma_head.")]
+    if new_only and len(new_only) == len(missing):
+        fresh = model_p.state_dict()
+        sd_p.update({k: fresh[k] for k in new_only})
+        print(f"[info] --ref-cond-entropy: initialised {len(new_only)} new parameter(s)")
+    model_p.load_state_dict(sd_p)
     model_p.lossy_compressor.update(force=True)
 
     cot = coding_order_table7x7()

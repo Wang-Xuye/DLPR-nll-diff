@@ -986,7 +986,10 @@ def train(args):
     model_i = NearLosslessCompressor_I(192, 5, "3P").to(device)
     for param in model_i.parameters():
         param.requires_grad_(False)
-    model_p = NearLosslessCompressor_P(args.latent_ch, 5, "3P", embed_dim=args.diff_embed_dim).to(device)
+    model_p = NearLosslessCompressor_P(
+        args.latent_ch, 5, "3P", embed_dim=args.diff_embed_dim,
+        ref_cond_entropy=args.ref_cond_entropy,
+    ).to(device)
 
     stage = args.stage.upper()
     diff_loss_scale = resolve_diff_loss_scale(args.diff_loss_scale)
@@ -1047,8 +1050,26 @@ def train(args):
         # {"model_state_dict": ...} wrapper and the "module." / "_orig_mod."
         # key prefixes are stripped automatically by normalize_checkpoint_keys.
         print(f"[info] resume checkpoint: {checkpoint_origin(ckp_p)}")
+        sd_p = normalize_checkpoint_keys(ckp_p)
+        # --ref-cond-entropy adds parameters; a checkpoint trained without it has no
+        # keys for them. Back-fill those (randomly initialised) instead of refusing
+        # to resume, and say so. Anything else missing is still a hard error.
+        missing = [k for k in model_p.state_dict() if k not in sd_p]
+        new_only = [k for k in missing if k.startswith("lossy_compressor.ref_sigma_head.")]
+        if new_only:
+            if len(new_only) != len(missing):
+                raise RuntimeError(
+                    f"{args.resume} is missing {len(missing)} keys, of which only "
+                    f"{len(new_only)} belong to --ref-cond-entropy; refusing to load."
+                )
+            fresh = model_p.state_dict()
+            sd_p.update({k: fresh[k] for k in new_only})
+            print(
+                f"[info] --ref-cond-entropy: initialised {len(new_only)} new "
+                f"ref_sigma_head parameter(s) (not present in the checkpoint)"
+            )
         try:
-            model_p.load_state_dict(normalize_checkpoint_keys(ckp_p))
+            model_p.load_state_dict(sd_p)
         except RuntimeError as err:
             raise RuntimeError(
                 f"failed to load {args.resume} into NearLosslessCompressor_P. A "
@@ -1257,6 +1278,17 @@ def parse_args():
              "elements, which is the direct lever on img_bpp. NOTE this changes the model "
              "shape, so it cannot be resumed from a 192-channel checkpoint - it has to go "
              "through Stage A again. Must match test_static_b_diff.py --latent-ch.",
+    )
+    parser.add_argument(
+        "--ref-cond-entropy",
+        action="store_true",
+        help="Condition the latent's entropy model on the two reference frames "
+             "(which the decoder already has for free): a small conv head predicts a "
+             "bounded log-scale that modulates sigma. Targets the base-layer side "
+             "information, which is currently 0.61 bpp vs 0.216 for the non-diffusion "
+             "baseline, without spending any residual bits. Adds parameters, so a "
+             "checkpoint trained without it is back-filled when resumed. Must match "
+             "test_static_b_diff.py --ref-cond-entropy.",
     )
     parser.add_argument("--diff-embed-dim", type=int, default=64,
                         help="Embedding width of the diffusion lossy compressor. Keep 64 for "

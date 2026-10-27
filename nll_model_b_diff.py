@@ -78,6 +78,7 @@ class LossyCompressor_B_diff_sit(CompressionModel):
         pred_mode="x",
         loss_weight_min=5.0,
         sample_steps=5,
+        ref_cond_entropy=False,
         *args,
         **kwargs,
     ):
@@ -92,6 +93,20 @@ class LossyCompressor_B_diff_sit(CompressionModel):
         self.ref_encoder = DualRefEncoder(embed_dim)
         self.denoise_fn = UNet_P(dim=embed_dim, channels=1)
         self.res_prior_head = ResPriorHead(embed_dim, 256)
+
+        # --ref-cond-entropy: let the reference frames (which the decoder already
+        # has) predict the scale of the latent's entropy model, instead of letting
+        # the hyperprior alone describe every element. The two references are
+        # available at no rate cost on both ends, so anything y only re-describes
+        # about them is pure waste. Kept behind a flag: it adds parameters, so a
+        # checkpoint trained without it cannot be resumed into a model with it
+        # unless the missing keys are back-filled (the train/test scripts do that).
+        self.ref_cond_entropy = bool(ref_cond_entropy)
+        self.ref_sigma_head = (
+            nn.Conv2d(embed_dim * 4, num_ch, 3, padding=1)
+            if self.ref_cond_entropy
+            else None
+        )
 
         self.num_timesteps = num_timesteps
         self.pred_mode = pred_mode
@@ -110,6 +125,31 @@ class LossyCompressor_B_diff_sit(CompressionModel):
         )
         self.register_buffer("train_snr", to_torch(alphas_cumprod / (1.0 - alphas_cumprod)))
         self.register_buffer("train_alphas_cumprod", to_torch(alphas_cumprod))
+
+    def _ref_feats(self, ref_l, ref_r):
+        return self.ref_encoder(
+            ref_l / nii_max_f * 2 - 1,
+            ref_r / nii_max_f * 2 - 1,
+        )
+
+    def _ref_condition(self, ref_feats, sigma_hat):
+        """Multiplicative (log-scale) modulation of sigma from the reference frames.
+
+        Returns sigma_hat untouched when the feature is disabled, so the default
+        path is bit-identical to the pre-flag code.
+        """
+        if self.ref_sigma_head is None or ref_feats is None:
+            return sigma_hat
+        log_scale = self.ref_sigma_head(ref_feats[-1])
+        if log_scale.shape[-2:] != sigma_hat.shape[-2:]:
+            log_scale = F.interpolate(
+                log_scale,
+                size=sigma_hat.shape[-2:],
+                mode="bilinear",
+                align_corners=False,
+            )
+        # Bounded so a single bad step cannot collapse or explode the entropy model.
+        return sigma_hat * torch.exp(log_scale.clamp(-2.0, 2.0))
 
     def q_sample(self, x_start, t, noise):
         return (
@@ -170,11 +210,14 @@ class LossyCompressor_B_diff_sit(CompressionModel):
 
         return img, feat
 
-    def _entropy_forward(self, input, ref_l, ref_r):
+    def _entropy_forward(self, input, ref_l, ref_r, ref_feats=None):
         y = self.encoder(input / nii_max_f, ref_l / nii_max_f, ref_r / nii_max_f)
         z = self.hyperencoder(y)
         z_hat, z_likelihoods = self.entropy_bottleneck(z)
         mu_hat, sigma_hat = self.hyperdecoder(z_hat)
+        if self.ref_sigma_head is not None and ref_feats is None:
+            ref_feats = self._ref_feats(ref_l, ref_r)
+        sigma_hat = self._ref_condition(ref_feats, sigma_hat)
         y_hat, y_likelihoods = self.gaussian_conditional(y, sigma_hat, means=mu_hat)
         return y_hat, {"y": y_likelihoods, "z": z_likelihoods}
 
@@ -183,9 +226,14 @@ class LossyCompressor_B_diff_sit(CompressionModel):
         ref_l_norm = ref_l / nii_max_f * 2 - 1
         ref_r_norm = ref_r / nii_max_f * 2 - 1
 
-        y_hat, likelihoods = self._entropy_forward(input, ref_l, ref_r)
+        # The reference features are needed by the entropy model (when
+        # --ref-cond-entropy is on) and by the DDIM sampler below; compute them
+        # once here so the flag does not add a second encoder pass.
+        ref_feats = self._ref_feats(ref_l, ref_r) if self.ref_cond_entropy else None
+        y_hat, likelihoods = self._entropy_forward(input, ref_l, ref_r, ref_feats=ref_feats)
         context_feats = self.context_decoder(y_hat)
-        ref_feats = self.ref_encoder(ref_l_norm, ref_r_norm)
+        if ref_feats is None:
+            ref_feats = self._ref_feats(ref_l, ref_r)
 
         if self.training:
             batch = x.shape[0]
@@ -232,6 +280,10 @@ class LossyCompressor_B_diff_sit(CompressionModel):
         z_hat = self.entropy_bottleneck.decompress(z_strings, z.size()[-2:])
 
         mu_hat, sigma_hat = self.hyperdecoder(z_hat)
+        # Must mirror _entropy_forward exactly, otherwise the encoder and the
+        # decoder disagree on the scale table and the lossless stream breaks.
+        if self.ref_sigma_head is not None:
+            sigma_hat = self._ref_condition(self._ref_feats(ref_l, ref_r), sigma_hat)
         n, c, h, w = mu_hat.shape
         indexes = self.gaussian_conditional.build_indexes(sigma_hat.reshape(1, n * c, h, w))
         y_strings = self.gaussian_conditional.compress(
@@ -246,6 +298,10 @@ class LossyCompressor_B_diff_sit(CompressionModel):
         z_hat = self.entropy_bottleneck.decompress(strings[1], shape[2:])
 
         mu_hat, sigma_hat = self.hyperdecoder(z_hat)
+        ref_feats = None
+        if self.ref_sigma_head is not None:
+            ref_feats = self._ref_feats(ref_l, ref_r)
+            sigma_hat = self._ref_condition(ref_feats, sigma_hat)
         n, c, h, w = mu_hat.shape
         indexes = self.gaussian_conditional.build_indexes(sigma_hat.reshape(1, n * c, h, w))
         y_hat = self.gaussian_conditional.decompress(
@@ -256,9 +312,8 @@ class LossyCompressor_B_diff_sit(CompressionModel):
         y_hat = y_hat.reshape(n, c, h, w)
 
         context_feats = self.context_decoder(y_hat)
-        ref_l_norm = ref_l / nii_max_f * 2 - 1
-        ref_r_norm = ref_r / nii_max_f * 2 - 1
-        ref_feats = self.ref_encoder(ref_l_norm, ref_r_norm)
+        if ref_feats is None:
+            ref_feats = self._ref_feats(ref_l, ref_r)
         out_shape = (ref_l.shape[0], 1, ref_l.shape[-2], ref_l.shape[-1])
         x_hat, feat = self.ddim_sample(out_shape, context_feats, ref_feats)
         res_prior = self.res_prior_head(feat)
@@ -283,12 +338,14 @@ class NearLosslessCompressor_P(BaseNearLosslessCompressor_P):
     codecs stay rate-comparable.
     """
 
-    def __init__(self, num_ch, cond_num, mask_type="3P", sample_steps=5, embed_dim=64, *args, **kwargs):
+    def __init__(self, num_ch, cond_num, mask_type="3P", sample_steps=5, embed_dim=64,
+                 ref_cond_entropy=False, *args, **kwargs):
         super().__init__(num_ch, cond_num, mask_type, *args, **kwargs)
         self.lossy_compressor = LossyCompressor_B_diff_sit(
             num_ch,
             embed_dim=embed_dim,
             sample_steps=sample_steps,
+            ref_cond_entropy=ref_cond_entropy,
         )
 
     def forward(self, input, pre, nxt, tau):
