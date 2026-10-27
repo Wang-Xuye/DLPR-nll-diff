@@ -986,7 +986,7 @@ def train(args):
     model_i = NearLosslessCompressor_I(192, 5, "3P").to(device)
     for param in model_i.parameters():
         param.requires_grad_(False)
-    model_p = NearLosslessCompressor_P(192, 5, "3P", embed_dim=args.diff_embed_dim).to(device)
+    model_p = NearLosslessCompressor_P(args.latent_ch, 5, "3P", embed_dim=args.diff_embed_dim).to(device)
 
     stage = args.stage.upper()
     diff_loss_scale = resolve_diff_loss_scale(args.diff_loss_scale)
@@ -1246,6 +1246,18 @@ def parse_args():
                              "[-1,1] MSE back to the raw [0,4095] domain, which is what makes "
                              "--lmbda comparable with train_static_b.py. It never changes the "
                              "logged eval/mse_loss or the checkpoint name.")
+    parser.add_argument(
+        "--latent-ch",
+        type=int,
+        default=192,
+        help="Channel count of the P-frame base-layer latent y. The default 192 is the "
+             "size every existing checkpoint was trained with, so the model shape and all "
+             "resumes are unchanged. Lowering it (e.g. 48) shrinks the diffusion side "
+             "information by the same factor: the latent stays at H/16 but has fewer "
+             "elements, which is the direct lever on img_bpp. NOTE this changes the model "
+             "shape, so it cannot be resumed from a 192-channel checkpoint - it has to go "
+             "through Stage A again. Must match test_static_b_diff.py --latent-ch.",
+    )
     parser.add_argument("--diff-embed-dim", type=int, default=64,
                         help="Embedding width of the diffusion lossy compressor. Keep 64 for "
                              "checkpoints trained with the default; use 32 to match the P-frame "

@@ -456,6 +456,14 @@ def main():
         help="Embedding width of the diffusion lossy compressor; must match the trained "
              "checkpoint (train_static_b_diff.py --diff-embed-dim).",
     )
+    parser.add_argument(
+        "--latent-ch",
+        type=int,
+        default=192,
+        help="Channel count of the P-frame base-layer latent y; must match the trained "
+             "checkpoint (train_static_b_diff.py --latent-ch). Default 192 is what every "
+             "checkpoint so far was trained with.",
+    )
     parser.add_argument("--gpu-id", "--cuda-visible-devices", dest="gpu_id", type=str, default=CUDA_VISIBLE_DEVICES)
     args = parser.parse_args()
 
@@ -466,7 +474,7 @@ def main():
     dataset = Dataset(args.data_path)
     model_i = NearLosslessCompressor_I(192, 5, "3P").eval().to(device)
     model_p = NearLosslessCompressor_P(
-        192, 5, "3P", sample_steps=args.steps, embed_dim=args.embed_dim
+        args.latent_ch, 5, "3P", sample_steps=args.steps, embed_dim=args.embed_dim
     ).eval().to(device)
 
     ckp_i = torch.load(args.i_frame_ckp, map_location=device, weights_only=False)
