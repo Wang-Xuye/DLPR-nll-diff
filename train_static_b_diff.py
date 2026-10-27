@@ -511,13 +511,19 @@ def warm_start_residual_head(model_i, model_p, dataloader, device,
 
 class StableRateDistortion(nn.Module):
     def __init__(self, lmbda=0.01, likelihood_lower_bound=1e-9, diffusion_only=False,
-                 diff_loss_scale=1.0):
+                 diff_loss_scale=1.0, img_rate_weight=1.0):
         super().__init__()
         self.mse = nn.MSELoss()
         self.lmbda = lmbda
         self.likelihood_lower_bound = likelihood_lower_bound
         self.diffusion_only = diffusion_only
         self.diff_loss_scale = diff_loss_scale
+        # Extra multiplier on the base-layer (diffusion side-information) rate only.
+        # img_bpp and res_bpp are two different knobs on the same rate budget: pushing
+        # img_rate_weight up buys a smaller base layer at the cost of a bigger residual,
+        # which lets us walk the (img, res) trade-off curve without touching --lmbda
+        # (that one trades distortion against *both* rate terms).
+        self.img_rate_weight = img_rate_weight
 
     def safe_likelihood(self, likelihoods):
         return torch.nan_to_num(
@@ -606,7 +612,11 @@ class StableRateDistortion(nn.Module):
             # several orders of magnitude and the encoder crushes the latent to
             # ~0 bpp. --diff-loss-scale puts the two recipes on the same scale.
             out["mse_weighted"] = self.lmbda * self.diff_loss_scale * out["mse_loss"]
-            out["loss"] = out["mse_weighted"] + out["img_bpp"] + out["res_bpp"]
+            out["loss"] = (
+                out["mse_weighted"]
+                + self.img_rate_weight * out["img_bpp"]
+                + out["res_bpp"]
+            )
         return out
 
 
@@ -985,13 +995,15 @@ def train(args):
         likelihood_lower_bound=args.likelihood_lower_bound,
         diffusion_only=(stage == "A"),
         diff_loss_scale=diff_loss_scale,
+        img_rate_weight=args.img_rate_weight,
     )
     if stage == "A":
         print("[info] stage A: base-layer warm-up, loss = diffusion_loss only (no rate terms)")
     else:
         print(
             f"[info] stage B: joint training, "
-            f"loss = {args.lmbda} * {diff_loss_scale:.6g} * diffusion_loss + img_bpp + res_bpp "
+            f"loss = {args.lmbda} * {diff_loss_scale:.6g} * diffusion_loss "
+            f"+ {args.img_rate_weight:g} * img_bpp + res_bpp "
             f"(effective distortion weight {args.lmbda * diff_loss_scale:.6g})"
         )
         if args.lmbda * diff_loss_scale < 100:
@@ -1239,6 +1251,16 @@ def parse_args():
                              "checkpoints trained with the default; use 32 to match the P-frame "
                              "diff-sit pipeline / save memory.")
     parser.add_argument("--likelihood-lower-bound", type=float, default=1e-9)
+    parser.add_argument(
+        "--img-rate-weight",
+        type=float,
+        default=1.0,
+        help="Extra multiplier on the base-layer (diffusion side-information) rate term "
+             "only: loss = mse_weighted + img_rate_weight * img_bpp + res_bpp. Default 1.0 "
+             "reproduces the old behaviour. Values > 1 push the base layer to spend fewer "
+             "bits and accept a bigger residual, which is exactly the (img, res) trade-off "
+             "knob; watch img_clamp_frac/res_clamp_frac for latent collapse.",
+    )
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--aux-lr", type=float, default=1e-3)
     parser.add_argument("--gamma", type=float, default=0.9)
